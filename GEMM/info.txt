@@ -1,0 +1,13 @@
+A: \in\mathbb{M} x mathbb{K}
+B: \in\mathbb{K} x mathbb{N}
+C: \in\mathbb{M} x mathbb{N}
+
+
+Order:
+    - CPU
+    - GPU Naive
+    - GPU Shared Tiling
+    - GPU Shared Tiling with coalesced memory accessing
+    - GPU Shared Tiling with coalesced memory accessing using Double Buffering
+    - WMMA Basic
+    - WMMA Double Buffering
