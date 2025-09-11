@@ -89,4 +89,4 @@ void tiled_buff_launcher(const float* d_A, const float* d_B, float* d_C, const i
 }
 
 // This line tells the compiler to create the code for the TILE_WIDTH = 32 version.
-template void tiled_buff_launcher<32>(const float*, const float*, float*, int, int, int);
+template void tiled_buff_launcher<16>(const float*, const float*, float*, int, int, int);

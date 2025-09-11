@@ -49,4 +49,4 @@ void tile_cm_launcher(const float* d_A, const float* d_B, float* d_C, const int 
 }
 
 // This line tells the compiler to create the code for the TILE_WIDTH = 32 version.
-template void tile_cm_launcher<32>(const float*, const float*, float*, int, int, int);
+template void tile_cm_launcher<16>(const float*, const float*, float*, int, int, int);

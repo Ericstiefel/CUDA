@@ -21,7 +21,7 @@ __global__ void gpu_naive_gemm(const float* A, const float* B, float* C, const i
 }
 
 void naive_launcher(const float* d_A, const float* d_B, float* d_C, const int M, const int K, const int N) {
-    dim3 threadsPerBlock(32, 32);
+    dim3 threadsPerBlock(16, 16);
 
     dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, 
                    (M + threadsPerBlock.y - 1) / threadsPerBlock.y);

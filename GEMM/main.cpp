@@ -12,7 +12,7 @@
 const int M = 2048; // Rows of A and C
 const int K = 2048; // Cols of A and Rows of B
 const int N = 2048; // Cols of B and C
-const int TILE_WIDTH = 32; // Tile width for the tiled GPU implementation
+const int TILE_WIDTH = 16; // Tile width for the tiled GPU implementation
 
 // --- CUDA Error Checking Macro ---
 #define CUDA_CHECK(err) { \
@@ -107,40 +107,30 @@ int main() {
     // =======================================================
     // 1. Run CPU Implementation (for verification)
     // =======================================================
-    std::cout << "\nRunning CPU implementation for verification..." << std::endl;
-    auto cpu_start = std::chrono::high_resolution_clock::now();
-    cpu_gemm(h_A, h_B, h_C_cpu, M, K, N);
-    auto cpu_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
-    std::cout << "CPU Time: " << cpu_duration.count() << " ms" << std::endl;
+    // std::cout << "\nRunning CPU implementation for verification..." << std::endl;
+    // auto cpu_start = std::chrono::high_resolution_clock::now();
+    // cpu_gemm(h_A, h_B, h_C_cpu, M, K, N);
+    // auto cpu_end = std::chrono::high_resolution_clock::now();
+    // std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
+    // std::cout << "CPU Time: " << cpu_duration.count() << " ms" << std::endl;
 
-    // =======================================================
-    // 2. (BASELINE)
-    // =======================================================
-    std::cout << "\nRunning Tiled GPU implementation (Baseline)..." << std::endl;
     CUDA_CHECK(cudaEventRecord(start));
-    tiled_buff_launcher<TILE_WIDTH>(d_A, d_B, d_C, M, K, N);
+    tc_launcher(d_A_half, d_B_half, d_C, M, K, N);
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaEventElapsedTime(&gpu_time, start, stop));
-    std::cout << "Tiled Buff GPU: " << gpu_time << " ms" << std::endl;
     CUDA_CHECK(cudaMemcpy(h_C_gpu_naive, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    verify_result(h_C_cpu, h_C_gpu_naive, M, N);
+    // verify_result(h_C_cpu, h_C_gpu_naive, M, N);
 
-    // =======================================================
-    // 3. (COMPARISON)
-    // =======================================================
-    std::cout << "\nRunning Basic Tensor Core GPU implementation (Comparison)..." << std::endl;
-    CUDA_CHECK(cudaMemset(d_C, 0, M * N * sizeof(float))); // Clear device memory for C
-    CUDA_CHECK(cudaEventRecord(start));
-    // 5. UPDATE TENSOR CORE LAUNCH to use half precision buffers
-    basic_tc_launcher(d_A_half, d_B_half, d_C, M, K, N);
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&gpu_time, start, stop));
-    std::cout << "Basic Tensor Core GPU Time: " << gpu_time << " ms" << std::endl;
-    CUDA_CHECK(cudaMemcpy(h_C_gpu_tiled, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    verify_result(h_C_cpu, h_C_gpu_tiled, M, N);
+
+    // CUDA_CHECK(cudaMemset(d_C, 0, M * N * sizeof(float))); 
+    // CUDA_CHECK(cudaEventRecord(start));
+    // tile_cm_launcher<TILE_WIDTH>(d_A, d_B, d_C, M, K, N);
+    // CUDA_CHECK(cudaEventRecord(stop));
+    // CUDA_CHECK(cudaEventSynchronize(stop));
+    // CUDA_CHECK(cudaEventElapsedTime(&gpu_time, start, stop));
+    // CUDA_CHECK(cudaMemcpy(h_C_gpu_tiled, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+    // // verify_result(h_C_cpu, h_C_gpu_tiled, M, N);
 
     // --- Cleanup ---
     CUDA_CHECK(cudaEventDestroy(start));
