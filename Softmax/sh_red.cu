@@ -35,7 +35,7 @@ __device__ void block_reduce(float* s_data, float& val, bool is_max) {
             }
         }
         __syncthreads();
-    }]
+    }
     val = s_data[0];
 }
 
