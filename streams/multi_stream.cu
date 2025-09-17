@@ -73,16 +73,16 @@ int main() {
     CUDA_CHECK(cudaMemcpyAsync(d_inpA, h_inpA, size, cudaMemcpyHostToDevice, streamA));
     CUDA_CHECK(cudaMemcpyAsync(d_inpB, h_inpB, size, cudaMemcpyHostToDevice, streamB));
 
-    kernelA<<<1, N, s1>>>(d_inpA, d_outA, N);
-    kernelB<<<1, N, s2>>>(d_inpB, d_outB, N);
+    kernelA<<<1, N, streamA>>>(d_inpA, d_outA, N);
+    kernelB<<<1, N, streamB>>>(d_inpB, d_outB, N);
 
     CUDA_CHECK(cudaEventRecord(eventA_done, streamA));
     CUDA_CHECK(cudaEventRecord(eventB_done, streamB));
 
-    CUDA_CHECK(cudaStreamWaitEvent(streamC, eventA_done, 0));
-    CUDA_CHECK(cudaStreamWaitEvent(streamC, eventB_done, 0));
+    CUDA_CHECK(cudaStreamWaitEvent(streamC, eventA_done));
+    CUDA_CHECK(cudaStreamWaitEvent(streamC, eventB_done));
 
-    kernelC<<<1, N>>>(d_outA, d_outB, d_outC, N);
+    kernelC<<<1, N, streamC>>>(d_outA, d_outB, d_outC, N);
 
     CUDA_CHECK(cudaMemcpy(h_outC, d_outC, size, cudaMemcpyDeviceToHost)); // Synchronous so no explicit call needed
 
