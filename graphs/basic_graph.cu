@@ -3,7 +3,7 @@ Simple Graph using Stream Capture that multiplies every element by two, single s
 */
 
 #include <cuda_runtime.h>
-#include <studio.h>
+#include <stdio.h>
 
 #define CUDA_CHECK(call)\
 do {\

@@ -3,7 +3,7 @@ This file will contain using cuda api to create a basic reusable graph
 */
 
 #include <cuda_runtime.h>
-#include <studio.h>
+#include <stdio.h>
 
 #define CUDA_CHECK(call) \
 do { \
