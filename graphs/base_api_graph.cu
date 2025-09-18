@@ -28,7 +28,7 @@ __global__ void kernelB(float* input, float* output, int N) {
 }
 __global__ void kernelC(const float* inputA, const float* inputB, float* output, int N) {
     if (threadIdx.x < N) {
-        output[threadIdx.x] = inputA[threadIdx.x] + inputB[threadIdx.x]
+        output[threadIdx.x] = inputA[threadIdx.x] + inputB[threadIdx.x];
     }
 }
 
