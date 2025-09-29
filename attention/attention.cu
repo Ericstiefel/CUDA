@@ -1,68 +1,60 @@
+// attention_with_existing_kernels_fused_init.cu
 #include <iostream>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <stdio.h>
-#include <cuda_runtime.h>
 #include <mma.h>
 #include <cuda_fp16.h>
-
-/*
-Steps:
-- Init random weight matrices
-- Matmul with input
-- QK^T / sqrt(d_k)
-- Softmax result with matmul V joint
-
-*/
+#include <ctime>
+#include <cmath>
 
 using namespace nvcuda;
 
+// ------------------ User-tunable model dims ------------------
+#define SEQ_LEN 32      // number of tokens (M)
+#define D_MODEL 128     // embedding dim (input feature size)
+#define D_K 64          // query/key dim
+#define D_V 64          // value dim
 
+// WMMA tile params 
 #define TILE_WIDTH 16
-#define N 128
-
-#define d_k 64 // Dims of input
-
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
 
-#define CEIL_DIV (((N) + (TILE_WIDTH) - 1) / TILE_WIDTH)
-#define INP_CEIL_DIV (((d_k) + (TILE_WIDTH) - 1) / TILE_WIDTH)
+#define CEIL_DIV(x,y) (((x)+(y)-1)/(y))
 
-
-#define CUDA_CHECK(call)\
-do {\
-    cudaError_t err = call;\
-    if (err != cudaSuccess) {\
-        fprintf(stderr, "CUDA Error in file %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));\
-        exit(EXIT_FAILURE);\
-    }\
+#define CUDA_CHECK(call)                                                       \
+do {                                                                           \
+    cudaError_t err = call;                                                    \
+    if (err != cudaSuccess) {                                                  \
+        fprintf(stderr, "CUDA Error in file %s at line %d: %s\n", __FILE__,    \
+                __LINE__, cudaGetErrorString(err));                            \
+        exit(EXIT_FAILURE);                                                    \
+    }                                                                          \
 } while (0)
 
-__global__ void init_random_matrix(half* ptr, unsigned long seed) {
+
+__global__ void init_random_matrix(half* ptr, int rows, int cols, unsigned long seed) {
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int col = blockDim.x * blockIdx.x + threadIdx.x;
 
-    if (row < N && col < N) {
-        int idx = row * N + col;
-
-        curandState_t localState;
-
+    if (row < rows && col < cols) {
+        int idx = row * cols + col;
+        curandState localState;
         curand_init(seed, idx, 0, &localState);
-
-        float random_val = __float2half(curand_uniform(&localState));
-        ptr[idx] = random_val;
+        float rv = curand_uniform(&localState);
+        ptr[idx] = __float2half(rv);
     }
 }
 
 
-__global__ void matmul_3stage(const half* __restrict__ A,
-                              const half* __restrict__ B,
-                              half* __restrict__ C,
-                              const int M,
-                              const int N,
-                              const int K)
+__global__ void matmul(const half* __restrict__ A,
+                       const half* __restrict__ B,
+                       half* __restrict__ C,
+                       const int M,
+                       const int N,
+                       const int K)
 {
     int global_row = blockIdx.y * blockDim.y + threadIdx.y;
     int global_col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,16 +62,17 @@ __global__ void matmul_3stage(const half* __restrict__ A,
     int warp_m = global_row / WMMA_M;
     int warp_n = global_col / WMMA_N;
 
+    // shared buffers (3-stage)
     __shared__ half A_tile[3][WMMA_M][WMMA_K];
     __shared__ half B_tile[3][WMMA_K][WMMA_N];
 
-    wmma::fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> A_frag[3];
-    wmma::fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> B_frag[3];
+    wmma::fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag[3];
+    wmma::fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag[3];
 
     wmma::fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
     wmma::fill_fragment(C_frag, 0.0f);
 
-    int num_k_tiles = K / WMMA_K; // Need to ceil_div (currently assumes an even division)
+    int num_k_tiles = (K + WMMA_K - 1) / WMMA_K; 
 
     int threads_per_block = blockDim.x * blockDim.y;
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
@@ -92,9 +85,8 @@ __global__ void matmul_3stage(const half* __restrict__ A,
                 int c = i % WMMA_K;
                 int global_r = (warp_m * WMMA_M) + r;
                 int global_c = tile_idx * WMMA_K + c;
-                half v = __float2half(0.0f);
-                if (global_r < M && global_c < K) v = A[ global_r * K + global_c ];
-                A_tile[buf_idx][r][c] = v;
+
+                A_tile[buf_idx][r][c] = (global_r < M && global_c < N) ? A[global_r * N + global_c] : __float2half(0.0f);
             }
         }
         {
@@ -102,38 +94,37 @@ __global__ void matmul_3stage(const half* __restrict__ A,
             for (int i = tid; i < B_elems; i += threads_per_block) {
                 int r = i / WMMA_N;
                 int c = i % WMMA_N;
-                int global_r = tile_idx * WMMA_K + r;
-                int global_c = (warp_n * WMMA_N) + c;
-                half v = __float2half(0.0f);
-                if (global_r < K && global_c < N) v = B[ global_r * N + global_c ];
-                B_tile[buf_idx][r][c] = v;
+                int global_r = tile_idx * WMMA_K + r;              
+                int global_c = (warp_n * WMMA_N) + c;         
+
+                B_tile[buf_idx][r][c] = (global_r < K && global_c < N) ? B[global_r * N + global_c] : __float2half(0.0f);
+                
             }
         }
     };
 
 
-    load_tile_to_shared(0, 0);
+    if (num_k_tiles > 0) load_tile_to_shared(0, 0);
     if (num_k_tiles > 1) load_tile_to_shared(1, 1);
-
     __syncthreads();
 
-    wmma::load_matrix_sync(A_frag[0], &A_tile[0][0][0], WMMA_K);
-    wmma::load_matrix_sync(B_frag[0], &B_tile[0][0][0], WMMA_N);
+    if (num_k_tiles > 0) {
+        wmma::load_matrix_sync(A_frag[0], &A_tile[0][0][0], WMMA_K);
+        wmma::load_matrix_sync(B_frag[0], &B_tile[0][0][0], WMMA_N);
+    }
     if (num_k_tiles > 1) {
         wmma::load_matrix_sync(A_frag[1], &A_tile[1][0][0], WMMA_K);
         wmma::load_matrix_sync(B_frag[1], &B_tile[1][0][0], WMMA_N);
     }
 
-
     for (int i = 0; i < num_k_tiles; ++i) {
-        int buf_i   = i % 3;         
-        int buf_i1  = (i + 1) % 3;   
-        int buf_i2  = (i + 2) % 3;  
+        int buf_i   = i % 3;
+        int buf_i1  = (i + 1) % 3;
+        int buf_i2  = (i + 2) % 3;
 
         if (i + 2 < num_k_tiles) {
             load_tile_to_shared(i + 2, buf_i2);
         }
-
 
         __syncthreads();
 
@@ -143,9 +134,9 @@ __global__ void matmul_3stage(const half* __restrict__ A,
         }
 
         wmma::mma_sync(C_frag, A_frag[buf_i], B_frag[buf_i], C_frag);
-
     }
 
+    // write results
     int out_row = warp_m * WMMA_M;
     int out_col = warp_n * WMMA_N;
 
@@ -158,126 +149,95 @@ __global__ void matmul_3stage(const half* __restrict__ A,
         for (int c = 0; c < WMMA_N; ++c) {
             int global_c = out_col + c;
             if (global_c >= N) continue;
-            C[ global_r * N + global_c ] = __float2half( c_tmp[r * WMMA_N + c] );
+            C[ global_r * N + global_c ] = __float2half( c_tmp[r * WMMA_N + c]);
         }
     }
 }
 
-__global__ void pack_weights_fused(const half* __restrict__ Wq,
-                                   const half* __restrict__ Wk,
-                                   const half* __restrict__ Wv,
-                                   half* __restrict__ Wf,
-                                   int K, int N, int N3) 
+__global__ void split_fused(const half* __restrict__ fused,
+                            half* __restrict__ Q_out,
+                            half* __restrict__ K_out,
+                            half* __restrict__ V_out,
+                            int seq_len, int Dk, int Dv)
 {
-    int r = blockIdx.y * blockDim.y + threadIdx.y; 
-    int c = blockIdx.x * blockDim.x + threadIdx.x; 
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (r >= K || c >= N3) return;
+    int Nf = 2 * Dk + Dv;
+    if (row >= seq_len || col >= (Dk > Dv ? Dk : Dv)) return; 
 
-    if (c < N) {
-        // Wq
-        Wf[r * N3 + c] = Wq[r * N + c];
-    } else if (c < 2 * N) {
-        // Wk
-        int kc = c - N;
-        Wf[r * N3 + c] = Wk[r * N + kc];
-    } else {
-        // Wv
-        int vc = c - 2 * N;
-        Wf[r * N3 + c] = Wv[r * N + vc];
+    if (row < seq_len) {
+        int base = row * Nf;
+        if (col < Dk) {
+            Q_out[row * Dk + col] = fused[base + col];
+        }
+        if (col < Dk) {
+            K_out[col * seq_len + row] = fused[base + Dk + col]; // Transpose K here (most opportune time)
+        }
+        if (col < Dv) {
+            V_out[row * Dv + col] = fused[base + 2 * Dk + col];
+        }
     }
 }
 
-
+// ------------------ Host flow ------------------
 int main() {
 
-    half* input;
+    // dims to match matmul's M/K/N naming:
+    const int M = SEQ_LEN;
+    const int K_dim = D_MODEL;          // shared dimension for X * W  (X: M x K_dim)
+    const int Dk = D_K;
+    const int Dv = D_V;
+    const int NFUSED = 2 * Dk + Dv;     // columns of fused weight
 
-    size_t inp_size = sizeof(half) * d_k * d_k;
+    cudaStream_t s0;
+    CUDA_CHECK(cudaStreamCreate(&s0));
 
-    CUDA_CHECK(cudaMalloc((void**)&input, inp_size));
+    // allocate X: (M x K_dim)
+    half* d_X;
+    CUDA_CHECK(cudaMalloc((void**)&d_X, sizeof(half) * M * K_dim));
 
-    cudaStream_t streamA;
+    half* d_fusedW;
+    CUDA_CHECK(cudaMalloc((void**)&d_fusedW, sizeof(half) * K_dim * NFUSED));
 
-    CUDA_CHECK(cudaStreamCreate(&streamA));
+    dim3 tpb(16,16);
+    dim3 bpg_X( CEIL_DIV(K_dim, tpb.x), CEIL_DIV(M, tpb.y) );
+    CUDA_CHECK(init_random_matrix<<<bpg_X, tpb, 0, s0>>>(d_X, M, K_dim, (unsigned long)time(NULL)));
 
-    dim3 inpThreadPerBlock(N, N);
-    dim3 inpBlocksPerGrid(INP_CEIL_DIV, INP_CEIL_DIV);
+    dim3 bpg_fused_init( CEIL_DIV(NFUSED, tpb.x), CEIL_DIV(K_dim, tpb.y) );
+    CUDA_CHECK(init_random_matrix<<<bpg_fused_init, tpb, 0, s0>>>(d_fusedW, K_dim, NFUSED, (unsigned long)time(NULL)+42));
+    CUDA_CHECK(cudaStreamSynchronize(s0));
 
-    CUDA_CHECK(init_random_matrix<<<inpBlocksPerGrid, inpThreadPerBlock, 0, streamA>>>(input, time(NULL));
+    half* d_fused_out;
+    CUDA_CHECK(cudaMalloc((void**)&d_fused_out, sizeof(half) * M * NFUSED));
+    CUDA_CHECK(cudaMemset(d_fused_out, 0, sizeof(half) * M * NFUSED));
+    dim3 mm_tpb(TILE_WIDTH, TILE_WIDTH);
+    dim3 mm_bpg( CEIL_DIV(NFUSED, mm_tpb.x), CEIL_DIV(M, mm_tpb.y) );
 
-    size_t weight_size =  sizeof(half) * d_k * N;
-
-    half *d_Q_W, *d_K_W, *d_V_W; // Assumed to be the same weight_size
-
-    CUDA_CHECK(cudaMalloc((void**)&d_Q_W, weight_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_K_W, weight_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_V_W, weight_size));
-
-    cudaStream_t streamB, streamC, streamD;
-
-    CUDA_CHECK(cudaStreamCreate(&streamB));
-    CUDA_CHECK(cudaStreamCreate(&streamC));
-    CUDA_CHECK(cudaStreamCreate(&streamD));
-
-    cudaEvent_t weight_init_doneB, weight_init_doneC, weight_init_doneD;
-
-    CUDA_CHECK(cudaEventCreate(&weight_init_doneB));
-    CUDA_CHECK(cudaEventCreate(&weight_init_doneC));
-    CUDA_CHECK(cudaEventCreate(&weight_init_doneD));
-
-    dim3 weightThreadsPerBlock(TILE_WIDTH, TILE_WIDTH);
-    dim3 weightBlocksPerGrid(CEIL_DIV, CEIL_DIV);
-    
-    CUDA_CHECK(cudaRecordEvent(weight_init_doneB, streamB));
-    CUDA_CHECK(cudaRecordEvent(weight_init_doneC, streamC));
-    CUDA_CHECK(cudaRecordEvent(weight_init_doneD, streamD));
-    
-
-    CUDA_CHECK(init_random_matrix<<<weightBlocksPerGrid, weightThreadsPerBlock, 0, streamB>>>(d_Q_W, time(NULL) + 1));
-    CUDA_CHECK(init_random_matrix<<<weightBlocksPerGrid, weightThreadsPerBlock, 0, streamC>>>(d_K_W, time(NULL) + 2));
-    CUDA_CHECK(init_random_matrix<<<weightBlocksPerGrid, weightThreadsPerBlock, 0, streamD>>>(d_V_W, time(NULL) + 3));
-
-    CUDA_CHECK(cudaStreamWaitEvent(streamA, weight_init_doneB));
-    CUDA_CHECK(cudaStreamWaitEvent(streamA, weight_init_doneC));
-    CUDA_CHECK(cudaStreamWaitEvent(streamA, weight_init_doneD));
-
-    half *d_Q, *d_K, *d_V;
-    CUDA_CHECK(cudaMalloc((void**)&d_Q, weight_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_K, weight_size));
-    CUDA_CHECK(cudaMalloc((void**)&d_V, weight_size));
-
-    cudaGraph_t graph; 
-    cudaGraphExec_t graph_executable;
-
-    cudaEvent_t record_attention;
-
-    half* fused_QKV;
-
-    int N3 = N * 3;
-
-    size_t fused_size = sizeof(half) * N3 * d_k;
-
-    dim3 fuse_tpb(16, 16);
-    dim3 fuse_bpg((N3 + fuse_tpb.x - 1) / fuse_tpb.x, (N3 + fuse_tpb.y - 1) / fuse_tpb.y);
-
-    CUDA_CHECK(cudaMalloc((void**)&fused_QKV, fused_size));
-
-    CUDA_CHECK(cudaEventCreate(&record_attention));
-
-    CUDA_CHECK(cudaStreamRecord(streamA, record_attention));
-
-    CUDA_CHECK(pack_weights_fused<<<fuse_bpg, fuse_tpb, 0, streamA>>>(d_Q_W, d_K_W, d_V_W, fused_QKV, N, N, N3));
+    CUDA_CHECK(matmul<<<mm_bpg, mm_tpb, 0, s0>>>(d_X, d_fusedW, d_fused_out, M, NFUSED, K_dim));
+    CUDA_CHECK(cudaStreamSynchronize(s0));
 
 
+    half *d_Q, *d_K_T, *d_V;
+    CUDA_CHECK(cudaMalloc((void**)&d_Q, sizeof(half) * M * Dk));
+    CUDA_CHECK(cudaMalloc((void**)&d_K_T, sizeof(half) * M * Dk));
+    CUDA_CHECK(cudaMalloc((void**)&d_V, sizeof(half) * M * Dv));
+
+    dim3 split_tpb(16, 16);
+    dim3 split_bpg( CEIL_DIV( (Dk> Dv? Dk : Dv), split_tpb.x ), CEIL_DIV(M, split_tpb.y) );
+    CUDA_CHECK(split_fused<<<split_bpg, split_tpb, 0, s0>>>(d_fused_out, d_Q, d_K_T, d_V, M, Dk, Dv));
+    CUDA_CHECK(cudaStreamSynchronize(s0));
 
 
-    CUDA_CHECK(cudaEventDestroy(weight_init_doneB));
-    CUDA_CHECK(cudaEventDestroy(weight_init_doneC));
-    CUDA_CHECK(cudaEventDestroy(weight_init_doneD));
+    // --- cleanup ---
+    CUDA_CHECK(cudaFree(d_X));
+    CUDA_CHECK(cudaFree(d_fusedW));
+    CUDA_CHECK(cudaFree(d_fused_out));
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K_T));
+    CUDA_CHECK(cudaFree(d_V));
 
-    CUDA_CHECK(cudaEventDestroy(matmulWB));
-    CUDA_CHECK(cudaEventDestroy(matmulWC));
+    CUDA_CHECK(cudaStreamDestroy(s0));
 
-    
+    return 0;
 }

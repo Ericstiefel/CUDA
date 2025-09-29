@@ -2,7 +2,7 @@
 Simple Asynch call with kernel launch
 */
 #include <cuda_runtime.h>
-#include <studio.h>
+#include <stdio.h>
 
 #define CUDA_CHECK(call) \
 do { \

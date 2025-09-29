@@ -2,7 +2,7 @@
 Very simple file just to implement a timer with events. Timing a small kernel.
 */
 #include <cuda_runtime.h>
-#include <studio.h>
+#include <stdio.h>
 
 #define CUDA_CHECK(call) \
 do { \
