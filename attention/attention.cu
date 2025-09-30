@@ -103,6 +103,121 @@ __global__ void matmul(const half* __restrict__ A,
         }
     };
 
+    load_tile_to_shared(0, 0);
+    if (num_k_tiles > 1) load_tile_to_shared(1, 1);
+
+    __syncthreads();
+
+    wmma::load_matrix_sync(A_frag[0], &A_tile[0][0][0], WMMA_K);
+    wmma::load_matrix_sync(B_frag[0], &B_tile[0][0][0], WMMA_N);
+    if (num_k_tiles > 1) {
+        wmma::load_matrix_sync(A_frag[1], &A_tile[1][0][0], WMMA_K);
+        wmma::load_matrix_sync(B_frag[1], &B_tile[1][0][0], WMMA_N);
+    }
+
+
+    for (int i = 0; i < num_k_tiles; ++i) {
+        int buf_i   = i % 3;         
+        int buf_i1  = (i + 1) % 3;   
+        int buf_i2  = (i + 2) % 3;  
+
+        if (i + 2 < num_k_tiles) {
+            load_tile_to_shared(i + 2, buf_i2);
+        }
+
+
+        __syncthreads();
+
+        if (i + 1 < num_k_tiles) {
+            wmma::load_matrix_sync(A_frag[buf_i1], &A_tile[buf_i1][0][0], WMMA_K);
+            wmma::load_matrix_sync(B_frag[buf_i1], &B_tile[buf_i1][0][0], WMMA_N);
+        }
+
+        wmma::mma_sync(C_frag, A_frag[buf_i], B_frag[buf_i], C_frag);
+
+    }
+
+    int out_row = warp_m * WMMA_M;
+    int out_col = warp_n * WMMA_N;
+
+    float c_tmp[WMMA_M * WMMA_N];
+    wmma::store_matrix_sync(c_tmp, C_frag, WMMA_N, wmma::mem_row_major);
+
+    for (int r = 0; r < WMMA_M; ++r) {
+        int global_r = out_row + r;
+        if (global_r >= M) continue;
+        for (int c = 0; c < WMMA_N; ++c) {
+            int global_c = out_col + c;
+            if (global_c >= N) continue;
+            C[ global_r * N + global_c ] = __float2half( c_tmp[r * WMMA_N + c] );
+        }
+    }
+
+}
+
+__global__ attention(const half* __restrict__ d_Q, const half* __restrict__ d_K_T, const half* __restrict__ d_V, const int N, const int d) {
+    const int global_row = blockDim.y * blockIdx.y + threadIdx.y;
+    const int global_col = blockDim.x * blockIdx.x + threadIdx.x;
+
+    const int threads_per_block = blockDim.x * blockDim.y;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    const int warp_m = global_row / WMMA_M;
+    const int warp_n = global_col / WMMA_N;
+
+    // Q and V tiles are of same size, K is transposed.
+    __shared__ half Q_tile[WMMA_M][WMMA_K];
+    __shared__ half Kt_tile[WMMA_K][WMMA_M]; 
+    __shared__ half V_tile[WMMA_M][WMMA_K];
+
+    const int elems = WMMA_M * WMMA_K;
+
+    auto load_q_tile = [&](const int tile_idx) {
+        {
+
+            for (int i = tid; i < elems; i += threads_per_block) {
+                int r = i / WMMA_K;
+                int c = i % WMMA_K;
+                int global_row = r + (warp_m * WMMA_M);
+                int global_col = c + (tile_idx * WMMA_K);
+
+                Q_tile[r][c] = (global_row < N && global_col < d) ? d_Q[global_row * d + global_col] : __float2half(0.0f);
+
+            }
+        }
+    };
+
+    auto load_kt_tile = [&](const int tile_idx) {
+        {
+            for (int i = tid; i < elems; i += threads_per_block) {
+                int r = i / WMMA_K;
+                int c = i % WMMA_K;
+
+                int global_row = r + warp_m * WMMA_M;
+                int global_col = c + tile_idx * WMMA_K;
+
+                Kt_tile[r][c] = (global_row < N && global_col < d) ? d_K_T[global_row * d + global_col] : __float2half(0.0f);
+            }
+        }
+    };
+
+    auto load_v_tile = [&](const int tile_idx) {
+        {
+            for (int i = tid; i < elems; i += threads_per_block) {
+                int r = i / WMMA_K;
+                int c = i % WMMA_K;
+
+                int global_row = r + warp_m * WMMA_M;
+                int global_col = c + tile_idx * WMMA_K;
+
+                V_tile[r][c] = (global_row < N && global_col < d) ? d_V[global_row * d + global_col] : __float2half(0.0f);
+            }
+        }
+    };
+
+
+}
+
 
     if (num_k_tiles > 0) load_tile_to_shared(0, 0);
     if (num_k_tiles > 1) load_tile_to_shared(1, 1);
