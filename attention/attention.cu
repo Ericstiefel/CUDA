@@ -1,4 +1,3 @@
-// attention_with_existing_kernels_fused_init.cu
 #include <iostream>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
@@ -7,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <ctime>
 #include <cmath>
+#include <cuda/pipeline>
 
 // Reminder for later: Convert tile loads from DRAM to Asynch
 
@@ -156,21 +156,19 @@ __global__ void matmul(const half* __restrict__ A,
 }
 
 
-__device__ float warpReduceMax(float val, unsigned mask = 0xffffffff) {
+// Assumes WMMA_M = WMMA_N = WMMA_K = 16
+__device__ float warpReduceMax(float val, unsigned mask = 0xffffffffu) {
     for (int offset = 16; offset > 0; offset /= 2)
         val = fmaxf(val, __shfl_down_sync(mask, val, offset));
     return val;
 }
-
-__device__ float warpReduceSum(float val, unsigned mask = 0xffffffff) {
+__device__ float warpReduceSum(float val, unsigned mask = 0xffffffffu) {
     for (int offset = 16; offset > 0; offset /= 2)
         val += __shfl_down_sync(mask, val, offset);
     return val;
 }
 
-
-
-__global__ void attention(const half* __restrict__ d_Q,
+__global__ void fwd_attention(const half* __restrict__ d_Q,
                           const half* __restrict__ d_K_T,
                           const half* __restrict__ d_V,
                           half* __restrict__ d_out,
@@ -178,8 +176,8 @@ __global__ void attention(const half* __restrict__ d_Q,
                           const int d)    // head dimension
 {
     // thread / block coords
-    const int local_row = threadIdx.y;
-    const int local_col = threadIdx.x;
+    const int local_row = threadIdx.y;           // 0..WMMA_M-1
+    const int local_col = threadIdx.x;           // 0..31 (warp lane)
     const int threads_per_block = blockDim.x * blockDim.y;
     const int tid = local_row * blockDim.x + local_col;
 
@@ -188,8 +186,15 @@ __global__ void attention(const half* __restrict__ d_Q,
 
     const int num_k_tiles = (d + WMMA_K - 1) / WMMA_K;
 
-    // Shared memory tiles & buffers
+    // REQUIRE: one warp per WMMA row mapping (we use lane shuffles per row)
+    if (!(blockDim.x == 32 && blockDim.y == WMMA_M)) {
+        if (tid == 0) {
+            printf("fwd_attention kernel requires blockDim.x==32 and blockDim.y==WMMA_M (WMMA_M=%d, blockDim.y=%d)\\n", WMMA_M, blockDim.y);
+        }
+        return;
+    }
 
+    // Shared memory tiles & buffers
     __shared__ half Q_tile[2][WMMA_M][WMMA_K];        // M x K  (row-major)
     __shared__ half Kt_tile[2][WMMA_K][WMMA_N];      // K x N  (row-major)
     __shared__ half V_tile[2][WMMA_N][WMMA_K];       // N x K  (row-major)
@@ -198,16 +203,15 @@ __global__ void attention(const half* __restrict__ d_Q,
     __shared__ float qkt_shared[2][WMMA_M][WMMA_N];  // M x N (float)
     __shared__ float softmax_out[2][WMMA_M][WMMA_N]; // numerators as float
 
+    // half buffer for WMMA load
+    __shared__ half softmax_half_buf[2][WMMA_M][WMMA_N];
+
     __shared__ float row_max[WMMA_M];
     __shared__ float row_den[WMMA_M];
     // rescale factor to apply to previous numerator O_old when max changes:
     __shared__ float rescale_factors[WMMA_M];
 
-    // -----------------------------
     // WMMA fragments (row-major layout)
-    // For Q*K^T : A(MxK) * B(KxN) -> C(MxN)   -> use (M,N,K)
-    // For softmax*V: A(MxN) * B(NxK) -> C(MxK) -> use (M,K,N)
-    // -----------------------------
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
@@ -216,48 +220,85 @@ __global__ void attention(const half* __restrict__ d_Q,
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_K, WMMA_N, half, wmma::row_major> v_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_K, WMMA_N, float> final_c_frag;
 
-    // -----------------------------
-    // Load helpers (shared mem fills)
-    // -----------------------------
+    constexpr int elements_per_cp = 8;   // 8 half elements == 16 bytes
+    constexpr int bytes_per_cp = 16;
+
+    // ---------- loaders (fixed indices and bounds) ----------
     auto load_q_tile = [&](int k_tile_idx, int buf) {
         const int flat = WMMA_M * WMMA_K;
-        for (int i = tid; i < flat; i += threads_per_block) {
-            int r = i / WMMA_K;
-            int c = i % WMMA_K;
-            int global_r = tile_row_idx * WMMA_M + r;       // along N
-            int global_c = k_tile_idx * WMMA_K + c;         // along d (head)
-            bool in_bounds = (global_r < N && global_c < d);
-            Q_tile[buf][r][c] = in_bounds ? d_Q[global_r * d + global_c] : __float2half(0.0f);
+        const half* gmem_dst_base = d_Q;
+        half* smem_dst = &Q_tile[buf][0][0];
+
+        for (int i = tid * elements_per_cp; i < flat; i += threads_per_block * elements_per_cp) {
+            int r = i / WMMA_K;            // 0..WMMA_M-1
+            int c = i % WMMA_K;            // 0..WMMA_K-1
+            int global_row = tile_row_idx * WMMA_M + r;  // along N
+            int global_col = k_tile_idx * WMMA_K + c;    // along d
+
+            const half* gmem_ptr = gmem_dst_base + global_row * d + global_col;
+            half* smem_ptr = smem_dst + r * WMMA_K + c;
+
+            if (global_row < N && global_col < d) {
+                asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::
+                             "r"(smem_ptr), "l"(gmem_ptr), "n"(bytes_per_cp));
+            }
         }
     };
 
+    // K^T tile: d_K_T is (d x N) row-major; we want WMMA_K x WMMA_N tile
     auto load_kt_tile = [&](int k_tile_idx, int buf) {
         const int flat = WMMA_K * WMMA_N;
-        for (int i = tid; i < flat; i += threads_per_block) {
-            int r = i / WMMA_N; // K index (0..WMMA_K-1)
-            int c = i % WMMA_N; // N index (0..WMMA_N-1)
-            int global_r = k_tile_idx * WMMA_K + r;         // K (head) index
-            int global_c = tile_row_idx * WMMA_N + c;       // sequence index (N)
-            bool in_bounds = (global_r < d && global_c < N);
-            // d_K_T is stored as K x N with stride N, so row-major access is: d_K_T[row * N + col]
-            Kt_tile[buf][r][c] = in_bounds ? d_K_T[global_r * N + global_c] : __float2half(0.0f);
+        const half* gmem_dst_base = d_K_T;
+        half* smem_dst = &Kt_tile[buf][0][0];
+
+        for (int i = tid * elements_per_cp; i < flat; i += threads_per_block * elements_per_cp) {
+            int r = i / WMMA_N;            // 0..WMMA_K-1
+            int c = i % WMMA_N;            // 0..WMMA_N-1
+            int global_row = k_tile_idx * WMMA_K + r;          // along d
+            int global_col = tile_row_idx * WMMA_N + c;        // along N
+
+            const half* gmem_ptr = gmem_dst_base + global_row * N + global_col; // d_K_T row-major
+            half* smem_ptr = smem_dst + r * WMMA_N + c;
+
+            if (global_row < d && global_col < N) {
+                asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::
+                             "r"(smem_ptr), "l"(gmem_ptr), "n"(bytes_per_cp));
+            }
         }
     };
 
+    // V tile: d_V is (N x d) row-major. We want WMMA_N x WMMA_K tile:
     auto load_v_tile = [&](int k_tile_idx, int buf) {
         const int flat = WMMA_N * WMMA_K;
-        for (int i = tid; i < flat; i += threads_per_block) {
-            int r = i / WMMA_K; // N index (0..WMMA_N-1)
-            int c = i % WMMA_K; // K index (0..WMMA_K-1)
-            int global_r = tile_row_idx * WMMA_N + r;       // sequence index (N)
-            int global_c = k_tile_idx * WMMA_K + c;         // head index (d)
-            bool in_bounds = (global_r < N && global_c < d);
-            V_tile[buf][r][c] = in_bounds ? d_V[global_r * d + global_c] : __float2half(0.0f);
+        const half* gmem_dst_base = d_V;
+        half* smem_dst = &V_tile[buf][0][0];
+
+        for (int i = tid * elements_per_cp; i < flat; i += elements_per_cp * threads_per_block) {
+            int r = i / WMMA_K;            // 0..WMMA_N-1
+            int c = i % WMMA_K;            // 0..WMMA_K-1
+            int global_row = tile_row_idx * WMMA_N + r;      // along N
+            int global_col = k_tile_idx * WMMA_K + c;        // along d
+
+            const half* gmem_ptr = gmem_dst_base + global_row * d + global_col;
+            half* smem_ptr = smem_dst + r * WMMA_K + c;
+
+            if (global_row < N && global_col < d) {
+                asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" ::
+                             "r"(smem_ptr), "l"(gmem_ptr), "n"(bytes_per_cp));
+            }
         }
     };
 
+    // PREP: Preloading into first buffer (if any tiles)
+    if (num_k_tiles > 0) {
+        load_q_tile(0, 0);
+        load_kt_tile(0, 0);
+        load_v_tile(0, 0);
+    }
+    asm volatile("cp.async.commit_group;");
 
-    wmma::fill_fragment(final_c_frag, 0.0f); 
+    // initialize accumulators and running-softmax stats
+    wmma::fill_fragment(final_c_frag, 0.0f);
 
     if (local_col == 0 && local_row < WMMA_M) {
         row_max[local_row] = -1e30f;
@@ -266,26 +307,27 @@ __global__ void attention(const half* __restrict__ d_Q,
     }
     __syncthreads();
 
+    // Precompute an active-lane mask that covers lanes [0..WMMA_N-1]
+    unsigned full_mask = __activemask();
+    unsigned active_mask;
+    if (WMMA_N == 32) active_mask = full_mask;
+    else active_mask = ( (WMMA_N >= 32) ? 0xffffffffu : ((1u << WMMA_N) - 1u) );
 
-    // PREP: Preloading into first buffer
-    if (num_k_tiles > 0) {
-        load_q_tile(0, 0);
-        load_kt_tile(0, 0);
-        load_v_tile(0, 0);
-    }
-    __syncthreads();
-
+    // iterate k-tiles
     for (int k_tile_idx = 0; k_tile_idx < num_k_tiles; ++k_tile_idx) {
         int compute_buf = k_tile_idx & 1;
         int next_k = k_tile_idx + 1;
-        // start loading next tile into the other buffer (if it exists)
+
+        // start loading next tile into the other buffer (if exists)
         if (next_k < num_k_tiles) {
             int load_buf = next_k & 1;
             load_q_tile(next_k, load_buf);
             load_kt_tile(next_k, load_buf);
             load_v_tile(next_k, load_buf);
         }
-        __syncthreads(); // ensure compute_buf is ready
+
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
 
         // ---------------------
         // Q * K^T -> c_frag (M x N)
@@ -306,26 +348,27 @@ __global__ void attention(const half* __restrict__ d_Q,
         // Online Softmax (per-row, warp-parallel)
         // ---------------------
         {
-            const int r = local_row; // row in WMMA_M
-            const int c = local_col; // col in WMMA_N
-            float my_val = (r < WMMA_M && c < WMMA_N) ? qkt_shared[compute_buf][r][c] : -INFINITY;
+            const int r = local_row; // row in WMMA_M (0..WMMA_M-1)
+            const int lane = local_col; // lane id (0..31)
 
-            // each row handled by one warp: warp_id = r, lane_id = c
-            unsigned mask = __activemask();
+            // safe read: qkt_shared is M x N with N<=32; lanes >= WMMA_N will use -INFINITY
+            float my_val = (r < WMMA_M && lane < WMMA_N) ? qkt_shared[compute_buf][r][lane] : -INFINITY;
 
-            // compute row max across warp lanes
+            // each warp handles one row; lanes >= WMMA_N are inactive
+            unsigned mask = active_mask; // only lanes 0..WMMA_N-1 participate
+
+            // compute row max across active lanes
             float chunk_max = warpReduceMax(my_val, mask);
 
             // exponentiate relative to chunk_max
-            float my_exp = (r < WMMA_M && c < WMMA_N) ? expf(my_val - chunk_max) : 0.0f;
+            float my_exp = (r < WMMA_M && lane < WMMA_N) ? expf(my_val - chunk_max) : 0.0f;
 
-            // compute row sum across warp lanes
+            // compute row sum across active lanes
             float chunk_sum = warpReduceSum(my_exp, mask);
 
-            // We will compute a per-row rescale factor (= exp(prev_max - new_max))
             // lane 0 updates running stats and writes rescale_factors[row]
-            float new_max_local = -INFINITY;
-            if (c == 0 && r < WMMA_M) {
+            float new_max_local = -INFINITY; // init for all lanes
+            if ((lane & 0x1f) == 0 && r < WMMA_M) { // lane 0 within warp
                 float prev_max = row_max[r];
                 float prev_den = row_den[r];
 
@@ -333,32 +376,29 @@ __global__ void attention(const half* __restrict__ d_Q,
                     // first tile for this row
                     row_max[r] = chunk_max;
                     row_den[r] = chunk_sum;
-                    // previous numerator is zero so scaling factor = 0 (O_old * 0 = 0)
                     rescale_factors[r] = 0.0f;
                 } else {
                     float new_max = fmaxf(prev_max, chunk_max);
                     float scaled_prev = expf(prev_max - new_max) * prev_den;
                     float scaled_chunk = expf(chunk_max - new_max) * chunk_sum;
-                    // scaling factor to apply to the previous numerator O_old:
-                    rescale_factors[r] = expf(prev_max - new_max); // = scaled_prev / prev_den
+                    rescale_factors[r] = expf(prev_max - new_max);
                     row_max[r] = new_max;
                     row_den[r] = scaled_prev + scaled_chunk;
                 }
                 new_max_local = row_max[r];
             }
 
-            // broadcast updated max to all lanes in warp from lane 0
+            // broadcast updated max to all lanes in warp from lane 0 (works even if lane>0)
             float new_max = __shfl_sync(mask, new_max_local, 0);
 
             // normalized numerator (w.r.t. new_max)
-            float my_num = (r < WMMA_M && c < WMMA_N) ? expf(my_val - new_max) : 0.0f;
-            if (r < WMMA_M && c < WMMA_N) {
-                softmax_out[compute_buf][r][c] = my_num;
+            float my_num = (r < WMMA_M && lane < WMMA_N) ? expf(my_val - new_max) : 0.0f;
+            if (r < WMMA_M && lane < WMMA_N) {
+                softmax_out[compute_buf][r][lane] = my_num;
             }
         } // end online softmax
 
         // convert softmax_out (float) -> half buffer for WMMA
-        __shared__ half softmax_half_buf[2][WMMA_M][WMMA_N];
         {
             const int flat = WMMA_M * WMMA_N;
             for (int i = tid; i < flat; i += threads_per_block) {
@@ -370,35 +410,21 @@ __global__ void attention(const half* __restrict__ d_Q,
         }
         __syncthreads();
 
-        // ---------------------
-        // Rescale the existing numerator accumulator (final_c_frag) if needed
-        // then compute softmax_chunk * V_tile and accumulate into final_c_frag
-        // ---------------------
-        // ensure rescale_factors are visible
-        __syncthreads();
-
-        // Apply per-row rescale factor to the accumulator fragment.
-        // final_c_frag is small; iterate over its elements and multiply by the row scale.
-        // Mapping: element index i -> row = i / WMMA_K (matches mem_row_major packing used elsewhere)
+        // apply rescale to previous accumulator fragment
         for (int i = 0; i < final_c_frag.num_elements; ++i) {
             int rr = i / WMMA_K; // row within 0..WMMA_M-1
             float scale_factor = rescale_factors[rr];
-            // if scale_factor==1.0f this is a cheap multiply; you may guard it if you prefer
             final_c_frag.x[i] *= scale_factor;
         }
 
-        // Now add the new chunk: softmax_chunk (M x N) * V_tile (N x K) -> accumulate into final_c_frag (M x K)
         wmma::load_matrix_sync(sm_frag, &softmax_half_buf[compute_buf][0][0], WMMA_N); // ld = WMMA_N
         wmma::load_matrix_sync(v_frag,  &V_tile[compute_buf][0][0],           WMMA_K); // ld = WMMA_K
         wmma::mma_sync(final_c_frag, sm_frag, v_frag, final_c_frag);
         __syncthreads();
     } // end k_tile loop
 
-    // ---------------------
-    // Write back final_c_frag (M x K) -> d_out (with normalization by row_den)
-    // ---------------------
+    // write final result tile to global memory
     {
-        // temporary storage in registers/shared: store fragment to local float array
         float tmpC[WMMA_M * WMMA_K];
         wmma::store_matrix_sync(tmpC, final_c_frag, WMMA_K, wmma::mem_row_major); // ld = WMMA_K
 
@@ -409,7 +435,6 @@ __global__ void attention(const half* __restrict__ d_Q,
             int global_r = tile_row_idx * WMMA_M + rr;
             int global_c = tile_col_idx * WMMA_K + cc;
             if (global_r < N && global_c < d) {
-                // divide by running denominator row_den[rr] to finalize softmax normalization
                 float denom = row_den[rr];
                 float val = tmpC[ rr * WMMA_K + cc ];
                 float scaled = denom > 0.0f ? (val / denom) : 0.0f;
@@ -418,7 +443,6 @@ __global__ void attention(const half* __restrict__ d_Q,
         }
     }
 }
-
 
 
 
@@ -451,64 +475,94 @@ __global__ void split_fused(const half* __restrict__ fused,
     }
 }
 
-// ------------------ Host flow ------------------
+
 int main() {
 
-    // dims to match matmul's M/K/N naming:
     const int M = SEQ_LEN;
-    const int K_dim = D_MODEL;          // shared dimension for X * W  (X: M x K_dim)
+    const int K_dim = D_MODEL;
     const int Dk = D_K;
     const int Dv = D_V;
-    const int NFUSED = 2 * Dk + Dv;     // columns of fused weight
+    const int NFUSED = 2 * Dk + Dv;
 
     cudaStream_t s0;
     CUDA_CHECK(cudaStreamCreate(&s0));
 
-    // allocate X: (M x K_dim)
-    half* d_X;
+    // Allocate ALL device memory needed for the graph beforehand
+    half *d_X, *d_fusedW, *d_fused_out, *d_Q, *d_K, *d_V, *d_out;
     CUDA_CHECK(cudaMalloc((void**)&d_X, sizeof(half) * M * K_dim));
-
-    half* d_fusedW;
     CUDA_CHECK(cudaMalloc((void**)&d_fusedW, sizeof(half) * K_dim * NFUSED));
+    CUDA_CHECK(cudaMalloc((void**)&d_fused_out, sizeof(half) * M * NFUSED));
+    CUDA_CHECK(cudaMalloc((void**)&d_Q, sizeof(half) * M * Dk));
+    CUDA_CHECK(cudaMalloc((void**)&d_K, sizeof(half) * M * Dk));
+    CUDA_CHECK(cudaMalloc((void**)&d_V, sizeof(half) * M * Dv));
+    CUDA_CHECK(cudaMalloc((void**)&d_out, sizeof(half) * M * Dv));
 
     dim3 tpb(16,16);
     dim3 bpg_X( CEIL_DIV(K_dim, tpb.x), CEIL_DIV(M, tpb.y) );
-    CUDA_CHECK(init_random_matrix<<<bpg_X, tpb, 0, s0>>>(d_X, M, K_dim, (unsigned long)time(NULL)));
+    init_random_matrix<<<bpg_X, tpb, 0, s0>>>(d_X, M, K_dim, (unsigned long)time(NULL));
 
     dim3 bpg_fused_init( CEIL_DIV(NFUSED, tpb.x), CEIL_DIV(K_dim, tpb.y) );
-    CUDA_CHECK(init_random_matrix<<<bpg_fused_init, tpb, 0, s0>>>(d_fusedW, K_dim, NFUSED, (unsigned long)time(NULL)+42));
+    init_random_matrix<<<bpg_fused_init, tpb, 0, s0>>>(d_fusedW, K_dim, NFUSED, (unsigned long)time(NULL)+42);
+
     CUDA_CHECK(cudaStreamSynchronize(s0));
 
-    half* d_fused_out;
-    CUDA_CHECK(cudaMalloc((void**)&d_fused_out, sizeof(half) * M * NFUSED));
-    CUDA_CHECK(cudaMemset(d_fused_out, 0, sizeof(half) * M * NFUSED));
+    cudaGraph_t graph;
+    
+
+    CUDA_CHECK(cudaStreamBeginCapture(s0, cudaStreamCaptureModeGlobal));
+
+
     dim3 mm_tpb(TILE_WIDTH, TILE_WIDTH);
     dim3 mm_bpg( CEIL_DIV(NFUSED, mm_tpb.x), CEIL_DIV(M, mm_tpb.y) );
-
-    CUDA_CHECK(matmul<<<mm_bpg, mm_tpb, 0, s0>>>(d_X, d_fusedW, d_fused_out, M, NFUSED, K_dim));
-    CUDA_CHECK(cudaStreamSynchronize(s0));
-
-
-    half *d_Q, *d_K_T, *d_V;
-    CUDA_CHECK(cudaMalloc((void**)&d_Q, sizeof(half) * M * Dk));
-    CUDA_CHECK(cudaMalloc((void**)&d_K_T, sizeof(half) * M * Dk));
-    CUDA_CHECK(cudaMalloc((void**)&d_V, sizeof(half) * M * Dv));
+    matmul<<<mm_bpg, mm_tpb, 0, s0>>>(d_X, d_fusedW, d_fused_out, M, NFUSED, K_dim);
 
     dim3 split_tpb(16, 16);
-    dim3 split_bpg( CEIL_DIV( (Dk> Dv? Dk : Dv), split_tpb.x ), CEIL_DIV(M, split_tpb.y) );
-    CUDA_CHECK(split_fused<<<split_bpg, split_tpb, 0, s0>>>(d_fused_out, d_Q, d_K_T, d_V, M, Dk, Dv));
+    dim3 split_bpg( CEIL_DIV(NFUSED, split_tpb.x), CEIL_DIV(M, split_tpb.y) );
+    split_fused<<<split_bpg, split_tpb, 0, s0>>>(d_fused_out, d_Q, d_K, d_V, M, Dk, Dv);
+
+    dim3 attn_tpb(32, WMMA_M);
+    dim3 attn_bpg(CEIL_DIV(Dv, WMMA_K), CEIL_DIV(M, WMMA_M));
+    fwd_attention<<<attn_bpg, attn_tpb, 0, s0>>>(d_Q, d_K, d_V, d_out, M, Dv);
+    
+    CUDA_CHECK(cudaStreamEndCapture(s0, &graph));
+
+
+    cudaGraphExec_t graph_exec;
+    CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+
+
+    const int num_runs = 100;
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start, s0));
+    for (int i = 0; i < num_runs; ++i) {
+        CUDA_CHECK(cudaGraphLaunch(graph_exec, s0));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, s0));
     CUDA_CHECK(cudaStreamSynchronize(s0));
 
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    printf("Execution time for %d graph launches: %.3f ms\n", num_runs, milliseconds);
+    printf("Average time per launch: %.6f ms\n", milliseconds / num_runs);
 
-    // --- cleanup ---
+
     CUDA_CHECK(cudaFree(d_X));
     CUDA_CHECK(cudaFree(d_fusedW));
     CUDA_CHECK(cudaFree(d_fused_out));
     CUDA_CHECK(cudaFree(d_Q));
-    CUDA_CHECK(cudaFree(d_K_T));
+    CUDA_CHECK(cudaFree(d_K));
     CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_out));
 
     CUDA_CHECK(cudaStreamDestroy(s0));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphExecDestroy(graph_exec));
 
     return 0;
 }
