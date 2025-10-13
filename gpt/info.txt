@@ -1,0 +1,16 @@
+This folder is designed to be an implementation of inference for a Text Generation style model.
+
+The architecture consists of n stacked decoder blocks.
+
+Decoder Block:
+    1. Masked Multi-Head Attention
+    2. Concatonate Heads & matmul w/ Wo
+    3. Add & Norm
+    4. Feed Forward
+    5. Add & Norm
+
+The input is first tokenized, embedded, and given positional embeddings. 
+Then, it passes through n decoder blocks. 
+After these, we have a linear layer to project the output of the decoders to the size of the vocabulary.
+We softmax this final output, and select a token to produce. 
+If it's not a <STOP> token, feed back into the model with the embedded input.
