@@ -38,11 +38,15 @@ __global__ void encodings(half* __restrict__ inp, half* __restrict__ out, int M,
     /*
     Simple encoding function (obviously learned in a real LLM)
 
-    sin(r * (vocab_idx))
+    sin(r * (vocab_idx)) (yes I know there will be recurring values because trig functions oscillate and reach the same values every sin(2x). This is just purely for demonstration.
     */
    
     if (row < M && col < N) {
+        int idx = row * N + col;
 
+        float comp = row * inp[row];
+
+        out[idx] = __float2half(__sinf(__float2half(comp)));
     }
 
 }
@@ -64,18 +68,18 @@ __global__ void positional_encodings(
     int row = blockIdx.y * blockDim.y + threadIdx.y;  // position index (pos)
     int col = blockIdx.x * blockDim.x + threadIdx.x;  // embedding dimension (dim)
 
-    if (row >= N || col >= M)
-        return;
+    if (row < M && col < N) {
 
-    int idx = row * M + col; 
+        int idx = row * M + col; 
 
-    float pos = static_cast<float>(row);
-    float i = static_cast<float>(col / 2);  
-    float denom = powf(10000.0f, (2.0f * i) / static_cast<float>(M));
+        float pos = static_cast<float>(row);
+        float i = static_cast<float>(col / 2);  
+        float denom = powf(10000.0f, (2.0f * i) / static_cast<float>(M));
 
-    float angle = pos / denom;
+        float angle = pos / denom;
 
-    float val = (col % 2 == 0) ? __sinf(angle) : __cosf(angle);
+        float val = (col % 2 == 0) ? __sinf(angle) : __cosf(angle);
 
-    out[idx] = __float2half(__half2float(inp[idx]) + val);
+        out[idx] = __float2half(__half2float(inp[idx]) + val);
+    }
 }
