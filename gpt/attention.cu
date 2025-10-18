@@ -116,14 +116,14 @@ __device__ __forceinline__ void load_v_tile(
     half* smem_dst = V_tile + buf * tile_size;
 
     for (int i = tid * elems_per_load; i < tile_size; i += threads_per_block * elems_per_load) {
-        int r = i / WMMA_N;
-        int c = i % WMMA_N;
+        int r = i / WMMA_K;
+        int c = i % WMMA_K;
 
-        int global_row = tile_idx * WMMA_K + r;
-        int global_col = blockIdx.x * WMMA_N + c;
+        int global_row = tile_idx * WMMA_M + r;
+        int global_col = blockIdx.x * WMMA_K + c;
 
         const half* gmem_ptr = d_V + global_row * d + global_col;
-        half* smem_ptr = smem_dst + r * WMMA_N + c;
+        half* smem_ptr = smem_dst + r * WMMA_K + c;
 
         if (global_row < d && global_col < N) {
             asm volatile(
