@@ -125,7 +125,7 @@ __device__ __forceinline__ void load_v_tile(
         const half* gmem_ptr = d_V + global_row * d + global_col;
         half* smem_ptr = smem_dst + r * WMMA_K + c;
 
-        if (global_row < d && global_col < N) {
+        if (global_row < N && global_col < d) {
             asm volatile(
                 "cp.async.ca.shared.global [%0], [%1], %2;\n" ::
                 "r"(smem_ptr), "l"(gmem_ptr), "n"(bytes_per_cp)
@@ -228,7 +228,7 @@ __global__ void masked_attention(const half* __restrict__ d_Qs,
         wmma::load_matrix_sync(b_frag, &Kt_tile[compute_buf][0][0], WMMA_N);
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 
-        const float scale = 1.0f / sqrtf((float)d);
+        const float scale = (1.0f / sqrtf((float)d * gridDim.z) );
         for (int i = 0; i < c_frag.num_elements; ++i) { c_frag.x[i] *= scale;}
 
         wmma::store_matrix_sync(&qkt_shared[compute_buf][0][0], c_frag, WMMA_N, wmma::row_major);
@@ -340,7 +340,8 @@ __global__ void masked_attention(const half* __restrict__ d_Qs,
                 float denom = row_den[rr];
                 float val = tmpC[rr * WMMA_K + cc];
                 float scaled = (denom > 0.0f) ? (val / denom) : 0.0f;
-                d_out[global_r * d + global_c] = __float2half(scaled);
+                d_out[(global_r * d + global_c) + start_point] = __float2half(scaled);
+                // d_out will be of dims num_heads * N x d
             }
         }
 
