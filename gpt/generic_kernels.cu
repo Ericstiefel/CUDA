@@ -90,3 +90,86 @@ __global__ void positional_encodings(
 
     out[idx] = __float2half(__half2float(inp[idx]) + val);
 }
+
+
+
+__device__ __forceinline__ float warpReduceSum(float val, unsigned mask = 0xffffffffu) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(mask, val, offset);
+    }
+    return val;
+}
+
+// dim3 tpb(M)
+// dim3 bpg(N)
+
+// Each row has its own thread block.
+
+// N is dim(vector embedding)
+// M is count(tokens_in_response), one guarenteed to be < 1024 in previous steps.
+
+__global__ add_n_norm(const half* __restrict__ conc_heads, const half* __restrict__ mmha, half* __restrict__ out, float* mean, float* std, int M, int N) 
+/*
+Finalized out from concatonating heads and matmul with W0 -> conc_heads: MxN
+Finalized out from Masked Multi-Head Attention -> mmha: MxN
+*/
+    {
+
+        __shared__ float vals[32]; // max 1024 tpb, so 1024 / 32 warps -> max(32) vals
+        int row = blockDim.y * blockIdx.y + threadIdx.y;
+        int col = blockDim.x * blockIdx.x + threadIdx.x;
+
+        int idx = row * N + col;
+
+        float sum = 0.0f;
+
+        for (int i = idx; i < M * N; i += blockDim.x * gridDim.x * blockDim.y * gridDim.y) { // This will only occur once per thread because of the given tpb & bpg, but done here for general completion
+            sum += conc_heads[i];
+        }
+
+        warpReduceSum(sum);
+
+        int warp_idx = threadIdx.x / 32;
+        int warp_lane = threadIdx.x % 32;
+
+        if (warp_lane == 0) { vals[warp_idx] = sum; }
+
+        __syncthreads();
+
+        if (warp_idx == 0) {
+            sum = vals[warp_lane];
+            warpReduceSum(sum);
+
+            if (warp_lane == 0) { *mean = sum / (M * N); }
+        }
+
+        __syncthreads(); // very necessary, especially with warp 0 being the only one scheduled for the last block
+
+        float avg = *mean;
+        sum = 0.0f;
+
+        for (int i = idx; i < M * N; i += blockDim.x * gridDim.x * blockDim.y * gridDim.y) {
+            sum += (conc_heads[i] - mean) * (conc_heads[i] - mean);
+        }
+
+        warpReduceSum(sum);
+
+        if (warp_lane == 0) { vals[warp_idx] = sum; }
+
+        __syncthreads();
+
+        if (warp_idx == 0) {
+            sum = vals[warp_lane];
+            warpReduceSum(sum);
+
+            if (warp_lane == 0) { *std = sum / (M * N - 1); }
+        }
+
+        __syncthreads();
+
+        for (int i = idx; i < M * N; i += blockDim.x * gridDim.x * blockDim.y * gridDim.y) {
+            out[i] = mmha[i] + (conc_heads[i] - mean) / (*std + 1e-9); 
+        }
+
+
+    }
