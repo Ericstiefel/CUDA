@@ -1,0 +1,21 @@
+Scans are used when you require the value to be correct for all i < N. 
+In reductions, we simply require the final value, and therefore perform less work. 
+xN-1 = x0 op x1 op ... , op xN-2, op xN-1. is true for every xi as opposed to just xN-1.
+
+There are two efficient scans, effectively creating a pareto fronteir for algorithms, the Kogge-Stone and Belloch Scans.
+
+Stats:
+Kogge-Stone:
+Time Complexity: O(logN)
+Work: O(NlogN)
+Active Threads: Constant 
+
+Belloch:
+Time Complexity: O(2logN)
+Work: O(N)
+Active Threads: Varies
+
+We can derrive from these quick statistics (specifically the work) we use Kogge-Stone (most of the time) when dealing with smaller data 
+that fits into shared memory, or even warp wide scans. We use Belloch when somehow, someway, we are unable to
+place this data into a more accessable memory location, and pay the heavy price Global Memory accessing, roughly 100x
+the price paid for Shared Memory per load.

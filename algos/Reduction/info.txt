@@ -1,0 +1,27 @@
+Tree Reduction is a general GPU algorithm with aim to find the final value in a group from an operation. 
+
+It is not complete, or meaning it doesn't find the correct value for every index, only the last one.
+
+Idea Behind: 
+xN-1 = x0 op x1 op ... , op xN-2, op xN-1. 
+On a CPU, we'd do these linearly in N steps.
+However, on a GPU this would mean serialized and dependent steps, defeating the whole purpose of using a GPU.
+
+So, we run these operations in a different manner, optimizing for the amount of operations required to complete any 1 value rather than for all N values.
+
+In this idea lies the Tree Reduction algorithm, which requires logN steps to compute the value needed, the final one.
+
+Unless we're building a Prefix Sum, it is often unnecessary to find the value for every index xi, rather we just often want to find the sum / max / min of a input data.
+
+How it works:
+
+iterate from stride = 1 -> stride = N / 2.
+For each stride, if i > stride, x[i] = op(x[i], x[i - stride]).
+That's it, quite simple.
+
+
+How to make it even more powerful:
+Warp Based Reduction:
+Because instructions are issued in warps (or groups of 32), doing operations reliant on the results of multiple warps require synchronization between all warps after each step.
+However, if we reduce by a factor of 32 (which turns out to be convenient anyway), the threads in a warp are all issued and execute instructions on the same time scale, requiring little to no synchronization latency.
+This is convenient (by design) as a result of the max threads per block being 1024 anyway, 1024 / 32 = 32, so per block you only need 2 reductions (first to find the value per warp, and then across all warps). 
