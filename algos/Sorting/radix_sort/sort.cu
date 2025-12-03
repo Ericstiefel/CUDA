@@ -68,3 +68,15 @@ __global__ void kogge_stone_scan(const int* __restrict__ global_hist, int* __res
 
     global_prefix[lid] = val;
 }
+
+__global__ void scatter(const int* __restrict__ inp, int* __restrict__ global_prefix, int* __restrict__ out, const int N, const int shift) {
+    int lid = threadIdx.x;
+    int gid = lid + blockDim.x * blockIdx.x;
+
+    for (int i = gid; i < N; i += blockDim.x * gridDim.x) {
+        int element = inp[i];
+        unsigned int bin = get_bits((unsigned int)element, shift);
+        int end_pos = atomicSub(&global_prefix[bin], 1);
+        out[end_pos - 1] = element;
+    }
+}
