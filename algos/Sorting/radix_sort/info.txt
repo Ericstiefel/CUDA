@@ -1,0 +1,22 @@
+Radix Sort has surprisingly early origins in the 1800s in regards to sorting large numbers of punchcards.
+It is additionally stable, meaning numbers with the same value will be kept in the original order.
+
+It is the fastest sort of extremely large sizes, and can be used for integers and (with a caveat) floats.
+Effectively, you force the compiler to treat the float as an int, and due to the IIEE float format,
+The float with the largest most significant bits will be larger, even though it is stored through
+sign, base, exponent. So like integers, the largest most significant bits indicates a larger number.
+Now, because the sign bit is the most significant bit, it will place negative numbers higher.
+This is why we must reform the integers, and if the num is positive, flip the sign bit to a 1.
+If it's negative, flip every bit. On the other end, you do the opposite.
+
+How it works:
+You can either do these three stages per digit (base 10) or by bit group (typically a group of 8 bits at a time).
+
+(1) Histogram over the group
+(2) Prefix Scan the histogram
+(3) Place everything in its rightful place in the output memory
+
+... do it again
+
+
+Comparison sorts are O(NlogN), but radix, due to being a non comparison sort is O(B*N), where B is the number of bit groups.
