@@ -15,14 +15,15 @@ to obtain blockwise sorted chunks.
 Bitonic Sort:
 Assumes input is of size 2^P, where P is an integer. If not, just pad with max val, 
 and remove them all later (they'll all be at the end).
-Iterates over Stage Size$D (from D=2 up to N, doubling each time). 
+
+Iterates over Stage Size D (from D=2 up to N, doubling each time). 
 This loop sets the overall direction for blocks of size D.
-Subiterates over Comparison Distance d (from $d = D/2$ down to 1, halving each time). 
+Subiterates over Comparison Distance d (from d = D/2 down to 1, halving each time). 
 This loop performs the Bitonic Merge.
 partner_tid = thread ID ^ d.
 If thread ID &  D == 0, we're ascending, otherwise descending.
 If we're ascending, the comparison ensures the element at lower thread ID is less than 
-the element at partner\_tid. If we're descending, the other way around.
+the element at partner_tid. If we're descending, the other way around.
 
 
 
@@ -30,3 +31,20 @@ Next, these monotonic chunks are passed through a highly parallel Merge Sort
 (or a similar parallel merge strategy) to obtain our finalized, globally sorted output.
 
 Merge Sort:
+
+Merge sort assumes blockSize K and input sorted within each block (done by an algorithm such as bitonic sort).
+
+How it works:
+1 thread block is assigned to 1 sorted input block.
+Until we have 1 continguous block (num blocks begin at r blocks and divide by 2 until you hit 1).
+Each time, we relaunch the kernel with different configurations (adding as many threads as we need (up to 1024)).
+At the end of each launch, all pairs of two adjacent blocks merge.
+
+How it works:
+Each thread looks at the adjacent list of sorted numbers, and binary searches its location in that list. 
+Small caveat: You require 2 binary searches, 1 for less than, 2 for less than and equal to to ensure two of the same element won't
+be placed in the same output index.
+The output index = current index in global list + binary searched index.
+
+We use double buffering not in shared memory but in having two read/write memory locations so we don't have to create a new output
+location every iteration, you simply swap pointers.
