@@ -1,0 +1,32 @@
+The fastest alternative to Radix Sort (fastest non-comparison sort overall in general cases) is Merge Sort, 
+as it is the fastest general-purpose comparison sorts in practice, with O(NlogN) average complexity 
+(many other comparison sorts share the same complexity, but merge sort is considered the fastest).
+Before discussing a global merging strategy, we must discuss Bitonic Sort, 
+as a highly parallel sort like this is commonly used for the initial local sorting phase on 
+parallel hardware like a GPU. This is because Bitonic Sort is highly efficient for fixed-size blocks 
+due to its data-independent comparison network, which minimizes thread divergence.
+The beauty of comparison sorts is they work in any data type which the comparison operator is defined. 
+This is in opposition to Radix Sort, which is generally for integers, and for floats with a caveat.
+
+
+
+We begin with our input, and pass it through Bitonic Sort (or another efficient local sort)
+to obtain blockwise sorted chunks.
+Bitonic Sort:
+Assumes input is of size 2^P, where P is an integer. If not, just pad with max val, 
+and remove them all later (they'll all be at the end).
+Iterates over Stage Size$D (from D=2 up to N, doubling each time). 
+This loop sets the overall direction for blocks of size D.
+Subiterates over Comparison Distance d (from $d = D/2$ down to 1, halving each time). 
+This loop performs the Bitonic Merge.
+partner_tid = thread ID ^ d.
+If thread ID &  D == 0, we're ascending, otherwise descending.
+If we're ascending, the comparison ensures the element at lower thread ID is less than 
+the element at partner\_tid. If we're descending, the other way around.
+
+
+
+Next, these monotonic chunks are passed through a highly parallel Merge Sort 
+(or a similar parallel merge strategy) to obtain our finalized, globally sorted output.
+
+Merge Sort:
