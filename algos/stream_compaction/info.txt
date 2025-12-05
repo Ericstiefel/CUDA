@@ -1,0 +1,8 @@
+Stream Compaction is a strategy generally for later reuse, where you only keep data that meet some condition (greater than a num, is even, etc).
+
+How it works:
+
+Kernel 1) Get a prefix sum per block of each element (exclusive).
+Output the sum of each block in a new memory location.
+Kernel 2) Take the sum resuls of each block and do a prefix sum over them
+Kernel 3) Place each output element (meeting the condition) to index local_idx + block_prefix[block_idx - 1].
