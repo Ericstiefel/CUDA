@@ -1,0 +1,26 @@
+A sparse matrix is typically a matrix that has at least have the values being 0. 
+
+There are actually many applications of this, especially when using one hot encoding, a typical technique
+for machine learning when learning an output over a discrete set. An example is the recommender system Netflix
+famously uses in which shows or movies you've watched are represented in an extremely large fixed size matrix,
+over all the shows on the site. If you've watched it, there's a 1, and if not, a 0. From this, they attempt to 
+predict the shows or movies you'd like to watch next. They (at least in the past) multiplied your watched matrix
+by a learned vector, outputting a distribution over all the movies and shows to recommend in order.
+
+There are a couple techniques for doing sparse matrix vector multiplication, in this, I will cover a slight
+optimization on using CSR format, or Compressed Sparse Row. 
+
+For CSR, instead of storing all the 0s, we only store the nonzero numbers. But for matrix multiplication,
+knowing their row / col is crucial for knowing what index of the vector to multiply by and where to sum the result in the output vector.
+So, we have 3 things to store (1 of them works in a way you wouldn't expect at first glance)
+
+Vals: All the nonzero vals simply in order.
+Cols: The column indecies of the vals. of length vals.
+Rows: A prefix sum of the number of nonzero vals in each row. of size M, where matrix A is M x N.
+
+So, the amount of elements in row i = Rows[i] - Rows[i - 1].
+
+A notable comparison of CSR is CSC, which we effectively transpose the data stored and focus on a 
+column based storage instead. This helps for potentially coalescing consecutive elements from consecutive threads, 
+but in the final accumulation (row of matrix x vector), we must use atomicAdd to avoid race conditions between threads,
+as opposed to CSR where a thread will compute a full row of values.
