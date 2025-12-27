@@ -1,0 +1,21 @@
+LayerNorm takes the data, and recenters it with a normal distribution, xi ~ N(0, 1).
+
+Obtain: 
+mean mu
+variance sigma^2
+
+Result:
+xi = (xi -  mu) / (sigma + epsillon), where epsillon just ensures a nonzero denominator.
+
+GPU ideas:
+Variance = E[X-E[X]]^2 = E[X^2] - E[X]^2
+Instead of calculating the mean and using it for the variance, we can do this all in one pass, 
+squaring every element and dividing by N, and just squaring the mean.
+
+
+So, in one pass,
+Accumulate each element for mean
+Accumulate squares of each element for the variance calculation
+
+
+Each thread block will handle a row of the matrix (assuming 2d).
