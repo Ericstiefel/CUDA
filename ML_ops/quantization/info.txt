@@ -1,0 +1,42 @@
+Quantization and Dequantization is the process of making the weights of matrices / vectors into lower bit values 
+so loads are less expensive per value. Because we can load values in 128 bit or 16 bytes at a time (designed for float4s in textures),
+stuffing as many of these values into a single float4 gives us a lower latency per value. This is typically done packing 8 half values into a float4,
+but during inference (with fixed weights), we can take this a step further. 
+
+By finding a general range of the outputs (through passing in multiple inputs), we can fix the weights by shifting by a base value and dividing by a value scale 
+that will reshift the input to its original value. 
+
+Suppose:
+MIN_WEIGHT = -2.0
+MAX_WEIGHT = 2.0
+Using INT8 (bounded between [-127, 127])
+
+SCALE = MAX_WEIGHT / 127 = 0.0157
+
+
+weight(example): 1.5
+1.5 / 0.0157 = 95.5, rounds to 96 (using ints so rounding required)
+Weight stored as 96.
+
+
+Now, if we store the SCALE and SHIFT (if not originally centered around 0, shift them to potentially use a smaller type), 
+we can Dequantize by multiplying the number by the SCALE and adding the SHIFT. This will not be perfect because we round in the 
+quantization process, but when exact precision is not required, is an amazing option for latency, notably in LLM inference.
+
+
+New Process of Matmul:
+Offline:
+Input: fp16 fixed weights
+output: int8 fixed weights, scale
+
+Get max weight, scale = max weight / 127.0.
+For each weight:
+int8 weight = round(weight / scale)
+
+Online:
+Take input matrix, for each element, int8 element = round(element / scale)
+
+Matmul with new int8 weight matrix, with a key difference.
+Loads will now be sizeof(float4) = 16 bytes = sizeof(half) * 8 = sizeof(int8) * 16. So double the input elements per load = roughly half the loading time per element. 
+Still ~200 clock cycles per async load (faster than sync load because data transfers GMEM -> L2 Cache, contrasterd with sync of GMEM -> registers -> SMEM).
+In the matmul, previously our computation was 16 x 16, 16 x 8 twice (B left & B right). Now, we're able to compute 16 x 32, 32 x 8, double the elements in the same ~15 clock cycles.
