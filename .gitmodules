@@ -1,3 +1,0 @@
-[submodule "gemm"]
-	path = gemm
-	url = https://github.com/Ericstiefel/GEMM
