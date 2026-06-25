@@ -25,9 +25,6 @@ __device__ __forceinline__ uint32_t swizzle_addr(const half* base_ptr, int row, 
     int chunk_idx = col / vals_per_vec;
     int offset = col % vals_per_vec;
 
-    // Mask to chunks_per_row's bit width: with fewer than 8 chunks/row (e.g. BK=32 -> 4
-    // chunks), XORing with the full row%8 overflows past the valid chunk range and aliases
-    // into the next row's slot. Masking keeps row%8 a no-op when chunks_per_row >= 8.
     int swizzled_col = chunk_idx ^ ((row % 8) % chunks_per_row);
     int flat_idx = (row * stride) + (swizzled_col * vals_per_vec) + offset;
 
@@ -58,8 +55,6 @@ __device__ __forceinline__ void ld_matrix_x4(uint32_t regs[4], uint32_t smem_add
     );
 }
 
-// B is stored row-major in shared memory, but mma's B operand needs a col-major
-// fragment. .trans makes ldmatrix do that transpose during the load.
 __device__ __forceinline__ void ld_matrix_x2(uint32_t regs[2], uint32_t smem_addr) {
     asm volatile (
         "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
@@ -103,13 +98,11 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     int lane_id = tx % 32;
     int warp_id = tx / 32;
 
-    // Base courier load coordinates for Pass 1
     int load_a_row = by * BM + (tx / 4);
     int load_a_col = (tx % 4) * 8;
     int load_b_row = tx / 16;
     int load_b_col = bx * BN + (tx % 16) * 8;
 
-    // Fixed register naming consistency
     uint32_t rA[4]; 
     uint32_t rB[2]; 
     float rC[4][4][4] = {0.0f}; // 64 output values of C per thread (128 x 128 / (8 * 32))
@@ -129,7 +122,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     cp_async_128(smem_wB_p1, &B[load_b_row * N + load_b_col]);
     cp_async_128(smem_wB_p2, &B[(load_b_row + 16) * N + load_b_col]);
     cp_async_commit(); 
-    wait_group<0>(); // Fixed function name call
+    wait_group<0>(); 
     __syncthreads();
 
     int warp_row = warp_id / 4;
@@ -144,7 +137,6 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     for (int tile_k = BK; tile_k < K; tile_k += BK) {
         write_stage ^= 1;
 
-        // Fetch Next Global Data Tiles into background write stage (2 Passes)
         smem_wA_p1 = swizzle_addr(&sA[write_stage][0][0], tx / 4, (tx % 4) * 8, BK);
         smem_wA_p2 = swizzle_addr(&sA[write_stage][0][0], tx / 4 + 64, (tx % 4) * 8, BK);
         cp_async_128(smem_wA_p1, &A[load_a_row * K + load_a_col + tile_k]);
@@ -205,7 +197,6 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     // Final computation:
     for (int k_dim = 0; k_dim < 2; ++k_dim) {
             for (int m_dim = 0; m_dim < 4; ++m_dim) {
-                // Load A tile & loop over loading respective B tiles
                 int a_row = warp_row_offset + (m_dim * 16) + (lane_id % 16);
                 int a_col = (k_dim * 16) + (lane_id / 16) * 8;
                 uint32_t smem_read_A = swizzle_addr(&sA[read_stage][0][0], a_row, a_col, BK);
@@ -222,12 +213,9 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
             }
         }
 
-    // mma.m16n8k16 accumulator fragment layout (per PTX ISA): row = (lane>>2) + 8*(l/2),
-    // col = 2*(lane%4) + (l%2), for l = 0..3 matching rC[m][n][0..3].
     int frag_row = lane_id / 4;
     int frag_col = (lane_id % 4) * 2;
 
-    // Added warp row/column spatial offsets so warps write to unique global memory slots
     int warp_global_row = by * BM + warp_row_offset; 
     int warp_global_col = bx * BN + warp_col_offset; 
 
