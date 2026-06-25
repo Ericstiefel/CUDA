@@ -86,6 +86,12 @@ __device__ __forceinline__ void mma(const uint32_t a[4], const uint32_t b[2], fl
 #define BN 128 
 #define BK 32
 
+/*
+Architecture: 8 warps per block, for computational purposes each warp will control 64 x 32 out of total 128 x 128 output space. warps are organized in 2x4 grid. 
+For loading purposes, we simply load in order, and with 16 bytes per load, 8 half values, we can cover A and B tiles (128 x 32 each) in 2 loads per.
+
+*/
+
 __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, float* __restrict__ C, const int M, const int K, const int N) {
     __shared__ half sA[2][BM][BK];
     __shared__ half sB[2][BK][BN];
