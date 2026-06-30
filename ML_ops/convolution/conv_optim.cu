@@ -113,7 +113,7 @@ __global__ void conv(const half* __restrict__ inp, half* __restrict__ out, const
         out[(size_t)tile_idx * M_out * N_out + gr * N_out + gc] = __float2half(result);
 
         if (has_next) {
-            read ^= 1; cp_async_wait_group<0>(); __syncthreads();
+            read ^= 1; cp_async_wait_group<1>(); __syncthreads();
         }
     }
 }
