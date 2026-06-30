@@ -59,7 +59,7 @@ __device__ __forceinline__ void cp_async_wait_group() {
 }
 
 // BM*BN (256) elements, 2 halfs (4 bytes) per thread -> needs 128 threads (4 warps)
-__device__ __forceinline__ void load_tile(const half* gmem_ptr, half* smem_ptr, const int tile_idx, const int buffer, const int M, const int N) {
+__device__ __forceinline__ void load_tile(const half* gmem_ptr, half* smem_ptr, const int tile_idx, const int M, const int N) {
     int lid = threadIdx.y * blockDim.x + threadIdx.x; // first 128 threads of each block
     if (lid < 128) {
         int row = lid / 8;        
@@ -67,7 +67,7 @@ __device__ __forceinline__ void load_tile(const half* gmem_ptr, half* smem_ptr, 
 
         const half* gmem_tile_begin = gmem_ptr + (size_t)tile_idx * M * N + (blockIdx.y * 14) * N + blockIdx.x * 14; // 14 output dim per block (offsetting by sizes of the output tiles).
         const half* load_from = gmem_tile_begin + row * N + col;
-        uint32_t smem_to = gts(smem_ptr + buffer * BM * BN + row * BN + col);
+        uint32_t smem_to = gts(smem_ptr + row * BN + col);
         cp_async_32(smem_to, load_from);
         cp_async_commit_group();
     }
@@ -85,7 +85,7 @@ __global__ void conv(const half* __restrict__ inp, half* __restrict__ out, const
 
     int read = 0; int write = 0;
 
-    load_tile(inp, &smem[0][0], 0, write, M, N);
+    load_tile(inp, &smem[write][0], write, M, N);
     cp_async_wait_group<0>(); __syncthreads();
 
     for (int tile_idx = 0; tile_idx < B; ++tile_idx) {
@@ -94,7 +94,7 @@ __global__ void conv(const half* __restrict__ inp, half* __restrict__ out, const
 
         if (has_next) {
             write ^= 1;
-            load_tile(inp, &smem[0][0], next_tile, write, M, N);
+            load_tile(inp, &smem[write][0], next_tile, write, M, N);
         }
 
         float result = 0.0f;
