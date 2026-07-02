@@ -1,0 +1,10 @@
+Static Embeddings: Multidimensional vector of trained embeddings.
+
+Positional Embeddings: Encoding the position of the vector somehow.
+SOTA on open source seems to be Rope, Rotary Positional Embeddings,
+rotating each input vector in sequences of pairs, matmulling the 2 dim vector with our
+typical rotation matrix, with input theta.
+
+The included kernel in this folder is an optimized version of that, but this is typically done
+in the process of writing back the input matmul with Q, K, V to gmem or the forward pass of self attention
+as the kernel is extremely memory bound and we can just apply it upon accessing the input for the other kernels.
