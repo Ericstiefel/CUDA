@@ -1,0 +1,57 @@
+This repo is a from scratch inference of GPT2 (autoregressive decoder) wrapped in a graph for overhead reduction.
+
+Because this is for inference, the input matrix will be randomized (so I don't have to grab embeddings 
+or open weights pretrained matrices), as this exercize is to improve my CUDA experience, not train a full LLM.
+
+The input will be of variable length, and the arbitrary dims will be of relatively normal sizes, 
+but also ensuring the entire system can fit simultaneously on 1 NVIDIA A4500 (Ampere Class) because it's what I have.
+
+In autoregressive models we append the last generated token at the end of the input text and run it through until a stop token is received, but 
+that's not the CUDA challenge of the model, so we will just mock do inference of a single token.
+
+
+Architecture:
+
+Tokenized Embedding input (just simply through a lookup map, these are the embeddings that are randomized) enters the model
+
+Positional embeddings of some sort are used. Real GPT2 uses learned absolute positional embeddings (a second
+lookup table of shape [max_seq_len, d_model] that just gets added onto the token embeddings at the input).
+I'll use Rotary Positional Embeddings instead, which are more standard nowadays even though they
+postdate GPT2, so this is an upgrade here and not the "real" GPT2 here.
+
+We get to the main transformer block (where just about all the CUDA work lies). 
+Each transformer block is
+    (a) LayerNorm -> Masked  Multi-Head Attention -> add residual
+    (b) LayerNorm -> Feed Forward NN -> add residual
+
+
+These transformer blocks get stacked, after which we get 1 more layernorm followed by a linear layer wrapped in softmax 
+to output the "probabilities" where index i is the token that should be predicted by the model. 
+
+For reference, GPT2-small (124M) is: 12 layers, 12 heads, d_model=768, d_ff=3072, context 1024, vocab 50257. 
+
+I know many modern models are quantized, but that's a relatively simple modern addition, so I'll just do the 
+whole thing in half (2 bytes) (acc in float32).
+
+
+Kernels I'm going to need:
+
+    - GEMM: Used for the QKV projection, the attention output projection, both FFN linears
+      (d->4d and 4d->d), and the final LM head. 
+
+    - Attention (fused):  QK^T ->  softmax -> MMA with V 
+
+    - Softmax standalone (or possibly fuse this one to the back of a feedforward kernel)
+
+    - LayerNorm: two per block (pre-norm, before attention and before the FFN) plus the final ln_f. Can fuse the
+      residual into it (or place this whole thing at the backend of the other kernels as the kernel is definitively memory bound 
+      with the time coming from waiting on the initial fetch, 1 more than I'd need if it was fused)
+    - RoPE: rotate Q and K by position. Probably don't need a standalone kernel, just fuse it into the front of
+      the attention kernel (right after the QKV projection, before QK^T).
+
+    Likely-fused / smaller ones included:
+    - GELU: elementwise, fuse into the epilogue of the FFN GEMM rather than a separate pass.
+    - Residual add: elementwise, fuse into the LayerNorm or the projection.
+
+
+
