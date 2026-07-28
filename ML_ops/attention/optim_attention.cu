@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cfloat>
@@ -440,7 +441,9 @@ __global__ void scale_kernel(float* __restrict__ data, float s, int n) {
 } while (0)
 
 int main() {
-    const int M = BM, Kseq = 4 * BK, Nh = BN;
+    // Nh is fixed at BN=128: the kernel hardcodes head-dim into the smem layout and ldmatrix
+    // addressing, so only M (query rows) and Kseq (key/value rows) are free to scale here.
+    const int M = 32 * BM, Kseq = 128 * BK, Nh = BN;
     srand(42);
 
     std::vector<half> hQ(M * Nh), hK(Kseq * Nh), hV(Kseq * Nh), hKT(Nh * Kseq);
@@ -487,6 +490,25 @@ int main() {
     // matters more at the matrix sizes this is meant to scale to than at M=Kseq=Nh=128. ----
     const int numIters = 100;
 
+    // ---- garbage warm-up: spin the SMs on throwaway work so clocks are out of the idle/boost
+    // ramp-up state before we start measuring. Runs -- and finishes -- before cudaProfilerStart,
+    // so it never shows up in an nsys/ncu capture of the region below. ----
+    {
+        const int garbageN = 1 << 24;
+        float* dGarbage;
+        CUDA_CHECK(cudaMalloc(&dGarbage, garbageN * sizeof(float)));
+        CUDA_CHECK(cudaMemset(dGarbage, 0, garbageN * sizeof(float)));
+        for (int i = 0; i < 50; ++i) {
+            scale_kernel<<<(garbageN + 255) / 256, 256>>>(dGarbage, 1.0001f, garbageN);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(dGarbage));
+    }
+
+    // Only the flash_attention kernel (warmup + timed loop) is inside the profiler capture range.
+    
+
     flash_attention<<<flashGrid, flashBlock, SMEM_BYTES>>>(dQ, dK, dV, dOut, M, Kseq, Nh); // warmup
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -500,8 +522,16 @@ int main() {
         flash_attention<<<flashGrid, flashBlock, SMEM_BYTES>>>(dQ, dK, dV, dOut, M, Kseq, Nh);
     }
     CUDA_CHECK(cudaEventRecord(stopEvt));
+
+    CUDA_CHECK(cudaProfilerStart());
+
+    flash_attention<<<flashGrid, flashBlock, SMEM_BYTES>>>(dQ, dK, dV, dOut, M, Kseq, Nh);
+
+    CUDA_CHECK(cudaProfilerStop());
+
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventSynchronize(stopEvt));
+    
     float oursMs = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&oursMs, startEvt, stopEvt));
     oursMs /= numIters;
