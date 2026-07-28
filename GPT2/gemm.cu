@@ -1,6 +1,10 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-
+#include <cuda_profiler_api.h>
+#include <cmath>
+#include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 
 __device__ __forceinline__ uint32_t smem_ptr_to_uint(const void* ptr) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
@@ -19,14 +23,14 @@ __device__ __forceinline__ uint32_t swizzle_addr(const half* base_smem, int row,
 }
 
 
-__device__ __forceinline__ void cp_async_128(uint32_t* smem_addr, const void* gmem_ptr) { // gmem -> smem async 
+__device__ __forceinline__ void cp_async_128(uint32_t smem_addr, const void* gmem_ptr) { // gmem -> smem async
     asm volatile (
         "cp.async.cg.shared.global [%0], [%1], 16;\n" 
         :: "r"(smem_addr), "l"(gmem_ptr)
     );
 }
 
-__device__ __forceinline__ void cp_async_commit() {
+__device__ __forceinline__ void cp_async_commit_group() {
     asm volatile (
         "cp.async.commit_group;\n"
     );
@@ -41,7 +45,7 @@ __device__ __forceinline__ void cp_async_wait_group() {
 // b16 for 16 bits per element
 __device__ __forceinline__ void ld_matrix_x4(uint32_t regs[4], uint32_t smem_addr) {
     asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3} [%4];\n"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
         : "r"(smem_addr) 
     );
@@ -49,13 +53,13 @@ __device__ __forceinline__ void ld_matrix_x4(uint32_t regs[4], uint32_t smem_add
 
 __device__ __forceinline__ void ld_matrix_x2(uint32_t regs[2], uint32_t smem_addr) {
     asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1} [%2];\n"
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
         : "=r"(regs[0]), "=r"(regs[1])
         : "r"(smem_addr)
     );
 }
 
-__device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], uint32_t rC[4]) {
+__device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], float rC[4]) {
     asm volatile (
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, "
@@ -64,7 +68,7 @@ __device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], 
         "{%0, %1, %2, %3};\n"
 
         :"+f"(rC[0]), "+f"(rC[1]), "+f"(rC[2]), "+f"(rC[3])
-        : "r"(rA[0]), "r"(rA[1]), "r"(rA[2]), "r"(rA[3])
+        : "r"(rA[0]), "r"(rA[1]), "r"(rA[2]), "r"(rA[3]),
         "r"(rB[0]), "r"(rB[1])
     );
 }
@@ -160,7 +164,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
         }
 
         read_stage ^= 1;
-        wait_group<1>();
+        cp_async_wait_group<1>();
         __syncthreads();
 
     }
@@ -201,7 +205,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     int frag_col = (lane % 4) * 2;
 
     int warp_global_row = blockIdx.y * BM + warp_row_offset;
-    int warp_global_col = blockIdx.x * BN + warp_col_offseet;
+    int warp_global_col = blockIdx.x * BN + warp_col_offset;
 
     #pragma unroll
     for (int m = 0; m < 4; ++m) {
@@ -221,4 +225,90 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
     }
 
 
+}
+
+#define CUDA_CHECK(call) do{ \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error %s:%d: %s \n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } \
+} while (0)
+
+
+
+int main() {
+    // Grab at least one of the dims of the matmuls we're going to use the matmul for.
+    // Must be exact multiples of the block tiles (no boundary masking in the kernel):
+    //   M % BM(128) == 0,  N % BN(128) == 0,  K % BK(32) == 0
+    int M = 4096;
+    int N = 4096;
+    int K = 1024;
+
+    half *h_A, *h_B; float* h_C;
+    CUDA_CHECK(cudaMallocHost(&h_A, sizeof(half) * M * K));
+    CUDA_CHECK(cudaMallocHost(&h_B, sizeof(half) * K * N));
+    CUDA_CHECK(cudaMallocHost(&h_C, sizeof(float) * M * N));
+
+    half *d_A, *d_B; float* d_C;
+    CUDA_CHECK(cudaMalloc(&d_A, sizeof(half) * M * K));
+    CUDA_CHECK(cudaMalloc(&d_B, sizeof(half) * K * N));
+    CUDA_CHECK(cudaMalloc(&d_C, sizeof(float) * M * N));
+
+
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < K; ++n) {
+            h_A[m * K + n] = static_cast<half>(((m + 1 + n * 2) % 17) / 19.0f);
+        }
+    }
+
+    for (int m = 0; m < K; ++m) {
+        for (int n = 0; n < N; ++n) {
+            h_B[m * N + n] = static_cast<half>(((m + 1 + n * 2) % 17) / 21.0f);
+        }
+    }
+
+
+    CUDA_CHECK(cudaMemcpy(d_A, h_A, sizeof(half) * M * K, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B, sizeof(half) * K * N, cudaMemcpyHostToDevice));
+
+    dim3 tpb(256);                    // 8 warps (2 x 4 warp grid) -> fixed by the kernel
+    dim3 bpg(N / BN, M / BM);         // x -> N tiles, y -> M tiles
+
+    for (int i = 0; i < 50; ++i) {
+        gemm<<<bpg, tpb>>>(d_A, d_B, d_C, M, K, N); // warming up  (grid, block)
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaProfilerStart());
+
+
+    gemm<<<bpg, tpb>>>(d_A, d_B, d_C, M, K, N);   // grid, block
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaProfilerStop());
+
+
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, sizeof(float) * M * N, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    
+
+
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+
+    CUDA_CHECK(cudaFreeHost(h_A));
+    CUDA_CHECK(cudaFreeHost(h_B));
+    CUDA_CHECK(cudaFreeHost(h_C));
+
+    return 0;
 }
