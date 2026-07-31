@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+﻿#include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -88,6 +88,9 @@ __device__ __forceinline__ void mma(const uint32_t* rA, const uint32_t* rB, floa
     );
 }
 
+// Streaming (max, sum) merge for a warp that sees its values one at a time and therefore has
+// to reconcile two different maxes at every step. Used by online_kernel; the attention kernel
+// has its whole tile in registers at once and uses the plain reductions below instead.
 template <int WIDTH>
 __device__ __forceinline__ void softmax_warp_call(float& l_max, float& l_sum) {
     unsigned int mask = 0xffffffff;
@@ -100,6 +103,25 @@ __device__ __forceinline__ void softmax_warp_call(float& l_max, float& l_sum) {
         l_sum = l_sum * expf(l_max - joint_max) + neighbor_sum * expf(neighbor_max - joint_max);
         l_max = joint_max;
     }
+}
+
+// Reduce across the 4 lanes that share one mma C-fragment row (see the softmax comment in
+// flash_attention). xor-butterfly rather than shfl_down, so the result lands in all 4 lanes
+// and no separate broadcast pass is needed.
+__device__ __forceinline__ float frag_row_max(float v) {
+    #pragma unroll
+    for (int offset = 2; offset > 0; offset /= 2) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset, 4));
+    }
+    return v;
+}
+
+__device__ __forceinline__ float frag_row_sum(float v) {
+    #pragma unroll
+    for (int offset = 2; offset > 0; offset /= 2) {
+        v += __shfl_xor_sync(0xffffffff, v, offset, 4);
+    }
+    return v;
 }
 
 #define BM 128
@@ -116,8 +138,8 @@ constexpr size_t V_ELEMS = 2 * BK * BN;
 constexpr size_t P_ELEMS = BM * BK;
 
 // This GPU (RTX A4500, Ampere/sm_86) has 100KB of shared memory per SM, and the 72KB below
-// fits easily -- BUT plain `__shared__` (static) arrays are capped at 48KB on every current CUDA
-// architecture regardless of the hardware's real per-SM capacity, so we just dynamically allocate. 
+// fits easily but static arrays are capped at 48KB on every current CUDA
+// architecture regardless of the hardware's real capacity, so we just dynamically allocate. 
 constexpr size_t SMEM_BYTES = (Q_ELEMS + K_ELEMS + V_ELEMS + P_ELEMS) * sizeof(half);
 
 __global__ void flash_attention(const half* __restrict__ Q, const half* __restrict__ K, const half* __restrict__ V, half* __restrict__ out, int d_M, int d_K, int d_N) {
@@ -140,13 +162,13 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     float attn_scale = rsqrtf((float)d_N);
 
     // Load full 128 x 128 tile of Q into smem
-    int load_Q_row = tid / 16; int load_Q_col = (tid % 16) * 8;
+    int load_row = tid / 16; int load_col = (tid % 16) * 8;
 
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         // Each warp can load a 2x128 (16 bytes per load), so block will load 16 x 128 (add 16 to row on each call)
-        uint32_t smem_Q_location = sw_ptr(sQ, load_Q_row + i * 16, load_Q_col, BN);
-        cp_async_128(smem_Q_location, &Q[(load_Q_row + BM * by + i * 16 ) * d_N + load_Q_col]);
+        uint32_t smem_Q_location = sw_ptr(sQ, load_row + i * 16, load_col, BN);
+        cp_async_128(smem_Q_location, &Q[(load_row + BM * by + i * 16 ) * d_N + load_col]);
     }
 
     int write = 0; int read = 0;
@@ -165,15 +187,14 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     */
 
 
-    int load_row = tid / 16; int load_col = (tid % 16) * 8;
-    uint32_t dst_k_1 = sw_ptr(sK, tid / 16, (tid % 16) * 8, BN); uint32_t dst_k_2 = sw_ptr(sK, tid / 16 + 16, (tid % 16) * 8, BN);
-    uint32_t dst_v_1 = sw_ptr(sV, tid / 16, (tid % 16) * 8, BN); uint32_t dst_v_2 = sw_ptr(sV, tid / 16 + 16, (tid % 16) * 8, BN);
+    
+    uint32_t dst_k_1 = sw_ptr(sK, load_row, load_col, BN); uint32_t dst_k_2 = sw_ptr(sK, load_row + 16, load_col, BN);
+    uint32_t dst_v_1 = sw_ptr(sV, load_row, load_col, BN); uint32_t dst_v_2 = sw_ptr(sV, load_row + 16, load_col, BN);
 
     cp_async_128(dst_k_1, &K[load_row * d_N + load_col]); cp_async_128(dst_k_2, &K[(load_row + 16) * d_N + load_col]);
     cp_async_128(dst_v_1, &V[load_row * d_N + load_col]); cp_async_128(dst_v_2, &V[(load_row + 16) * d_N + load_col]);
     cp_async_commit_group(); cp_async_wait_group<0>(); __syncthreads();
 
-    int lane_group = tid % 8; int row_in_group = tid / 8;
 
 
     for (int tile_k = 0; tile_k < d_K; tile_k += BK) {
@@ -185,8 +206,8 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
 
             // Async load next K & V into smem
             half* sK_w = sK + write * BK * BN; half* sV_w = sV + write * BK * BN;
-            dst_k_1 = sw_ptr(sK_w, tid / 16, (tid % 16) * 8, BN); dst_k_2 = sw_ptr(sK_w, tid / 16 + 16, (tid % 16) * 8, BN);
-            dst_v_1 = sw_ptr(sV_w, tid / 16, (tid % 16) * 8, BN); dst_v_2 = sw_ptr(sV_w, tid / 16 + 16, (tid % 16) * 8, BN);
+            dst_k_1 = sw_ptr(sK_w, load_row, load_col, BN); dst_k_2 = sw_ptr(sK_w, load_row + 16, load_col, BN);
+            dst_v_1 = sw_ptr(sV_w, load_row, load_col, BN); dst_v_2 = sw_ptr(sV_w, load_row + 16, load_col, BN);
 
             cp_async_128(dst_k_1, &K[load_row * d_N + load_col + next_tile_k * d_N]); cp_async_128(dst_k_2, &K[(load_row + 16) * d_N + load_col + next_tile_k * d_N]);
             cp_async_128(dst_v_1, &V[load_row * d_N + load_col + next_tile_k * d_N]); cp_async_128(dst_v_2, &V[(load_row + 16) * d_N + load_col + next_tile_k * d_N]);
@@ -223,6 +244,11 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
         // Each lane holds 8 of the 32 BK columns per row; the other 24 live in the other 3
         // lanes that share this lane's groupID (tig = 0..3) -- so the reduction has to be
         // 4-wide, not 32-wide.
+        //
+        // The whole tile is already in registers, so the row max can be reduced first and
+        // every score then exponentiated exactly once, against the final running max. There
+        // is no provisional max to exponentiate against and reconcile later, which is what
+        // softmax_warp_call exists to handle for the streaming case.
 
         #pragma unroll
         for (int n_dim = 0; n_dim < 4; ++n_dim) {
@@ -230,36 +256,21 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
             scores[n_dim * 4 + 2] *= attn_scale; scores[n_dim * 4 + 3] *= attn_scale;
         }
 
-        float local_max[2] = { -FLT_MAX, -FLT_MAX };
+        // Row max: over the 8 columns this lane holds, then across the lane's 4-wide group.
+        float tile_max0 = -FLT_MAX, tile_max1 = -FLT_MAX;
         #pragma unroll
         for (int n_dim = 0; n_dim < 4; ++n_dim) {
-            local_max[0] = fmaxf(local_max[0], fmaxf(scores[n_dim * 4 + 0], scores[n_dim * 4 + 1]));
-            local_max[1] = fmaxf(local_max[1], fmaxf(scores[n_dim * 4 + 2], scores[n_dim * 4 + 3]));
+            tile_max0 = fmaxf(tile_max0, fmaxf(scores[n_dim * 4 + 0], scores[n_dim * 4 + 1]));
+            tile_max1 = fmaxf(tile_max1, fmaxf(scores[n_dim * 4 + 2], scores[n_dim * 4 + 3]));
         }
+        tile_max0 = frag_row_max(tile_max0);
+        tile_max1 = frag_row_max(tile_max1);
 
-        float local_sum[2] = { 0.0f, 0.0f };
-        #pragma unroll
-        for (int n_dim = 0; n_dim < 4; ++n_dim) {
-            local_sum[0] += expf(scores[n_dim * 4 + 0] - local_max[0]) + expf(scores[n_dim * 4 + 1] - local_max[0]);
-            local_sum[1] += expf(scores[n_dim * 4 + 2] - local_max[1]) + expf(scores[n_dim * 4 + 3] - local_max[1]);
-        }
-
-        // Reduce each row's (max, sum) across its 4-lane group, then broadcast the result
-        // (shfl_down only leaves the correct answer in the group's lane 0) back to all 4 lanes.
-        softmax_warp_call<4>(local_max[0], local_sum[0]);
-        softmax_warp_call<4>(local_max[1], local_sum[1]);
-        float tile_max0 = __shfl_sync(0xffffffff, local_max[0], 0, 4);
-        float tile_sum0 = __shfl_sync(0xffffffff, local_sum[0], 0, 4);
-        float tile_max1 = __shfl_sync(0xffffffff, local_max[1], 0, 4);
-        float tile_sum1 = __shfl_sync(0xffffffff, local_sum[1], 0, 4);
-
+        // Fold this tile's max into the running max and rescale what is already accumulated.
         float new_max0 = fmaxf(m_row[0], tile_max0);
         float new_max1 = fmaxf(m_row[1], tile_max1);
         float correction0 = expf(m_row[0] - new_max0);
         float correction1 = expf(m_row[1] - new_max1);
-
-        l_row[0] = l_row[0] * correction0 + tile_sum0 * expf(tile_max0 - new_max0);
-        l_row[1] = l_row[1] * correction1 + tile_sum1 * expf(tile_max1 - new_max1);
         m_row[0] = new_max0;
         m_row[1] = new_max1;
 
@@ -269,25 +280,33 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
             acc[j * 4 + 2] *= correction1; acc[j * 4 + 3] *= correction1;
         }
 
-        half P[16];
+        // P = exp(S - m). Summed as it is built, and since it is already relative to the new
+        // running max, the tile's sums merge into l_row with no rescale of their own.
+        float P[16];
+        float tile_sum0 = 0.0f, tile_sum1 = 0.0f;
         #pragma unroll
         for (int n_dim = 0; n_dim < 4; ++n_dim) {
-            P[n_dim * 4 + 0] = __float2half(expf(scores[n_dim * 4 + 0] - m_row[0]));
-            P[n_dim * 4 + 1] = __float2half(expf(scores[n_dim * 4 + 1] - m_row[0]));
-            P[n_dim * 4 + 2] = __float2half(expf(scores[n_dim * 4 + 2] - m_row[1]));
-            P[n_dim * 4 + 3] = __float2half(expf(scores[n_dim * 4 + 3] - m_row[1]));
+            P[n_dim * 4 + 0] = expf(scores[n_dim * 4 + 0] - m_row[0]);
+            P[n_dim * 4 + 1] = expf(scores[n_dim * 4 + 1] - m_row[0]);
+            P[n_dim * 4 + 2] = expf(scores[n_dim * 4 + 2] - m_row[1]);
+            P[n_dim * 4 + 3] = expf(scores[n_dim * 4 + 3] - m_row[1]);
+
+            tile_sum0 += P[n_dim * 4 + 0] + P[n_dim * 4 + 1];
+            tile_sum1 += P[n_dim * 4 + 2] + P[n_dim * 4 + 3];
         }
+        l_row[0] = l_row[0] * correction0 + frag_row_sum(tile_sum0);
+        l_row[1] = l_row[1] * correction1 + frag_row_sum(tile_sum1);
 
         #pragma unroll
         for (int n_dim = 0; n_dim < 4; ++n_dim) {
             uint32_t p_addr0 = sw_ptr(sP, q_row_base + groupID, n_dim * 8 + tig * 2, BK);
-            st_shared_b16(p_addr0, P[n_dim * 4 + 0]);
+            st_shared_b16(p_addr0, __float2half(P[n_dim * 4 + 0]));
             uint32_t p_addr1 = sw_ptr(sP, q_row_base + groupID, n_dim * 8 + tig * 2 + 1, BK);
-            st_shared_b16(p_addr1, P[n_dim * 4 + 1]);
+            st_shared_b16(p_addr1, __float2half(P[n_dim * 4 + 1]));
             uint32_t p_addr2 = sw_ptr(sP, q_row_base + groupID + 8, n_dim * 8 + tig * 2, BK);
-            st_shared_b16(p_addr2, P[n_dim * 4 + 2]);
+            st_shared_b16(p_addr2, __float2half(P[n_dim * 4 + 2]));
             uint32_t p_addr3 = sw_ptr(sP, q_row_base + groupID + 8, n_dim * 8 + tig * 2 + 1, BK);
-            st_shared_b16(p_addr3, P[n_dim * 4 + 3]);
+            st_shared_b16(p_addr3, __float2half(P[n_dim * 4 + 3]));
         }
         __syncwarp();
 
