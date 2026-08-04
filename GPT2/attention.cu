@@ -21,8 +21,7 @@ __device__ __forceinline__ uint32_t cvta_generic_to_shared(const void* ptr) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(const_cast<void*>(ptr)));
 }
 
-// XOR swizzle over 16-byte chunks. Only valid when stride >= 64 halves, i.e.
-// vecs_per_row >= 8 -- below that the (row % 8) term aliases and rows collide.
+
 __device__ __forceinline__ uint32_t swizzled_ptr(const void* smem_ptr, int row, int col, int stride) {
     int eles_per_vec = 16 / (int)sizeof(half);
     int vecs_per_row = stride / eles_per_vec;
@@ -94,8 +93,7 @@ __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
     return *reinterpret_cast<const uint32_t*>(&h);
 }
 
-// A C-fragment row lives in the 4 lanes of a quad, so width-4 shuffles are a full
-// row reduction with no shared memory and no block-wide barrier.
+
 __device__ __forceinline__ float max_reduction(float val) {
     unsigned mask = 0xffffffff;
     #pragma unroll
@@ -117,19 +115,26 @@ __device__ __forceinline__ float sum_reduction(float sum) {
 
 #define BM 128   // Q rows per block tile
 #define BN 128   // head dim, also the smem row stride
-#define BK 32    // K/V rows (keys) per streamed tile
+#define BK 64    // K/V rows (keys) per streamed tile
 
 #define WARPS   8
 #define WARP_M  (BM / WARPS)      // 16 Q rows per warp -> one m16 mma tile
 
-#define QK_K_STEPS  (BN / 16)     // 8  reduction steps over head dim
-#define QK_N_TILES  (BK / 8)      // 4  n-tiles of S, 8 keys each
-#define PV_K_STEPS  (BK / 16)     // 2  reduction steps over keys
+#define QK_K_STEPS  (BN / 16)     // 8 reduction steps over head dim
+#define QK_N_TILES  (BK / 8)      // n-tiles of S, 8 keys each
+#define PV_K_STEPS  (BK / 16)     // reduction steps over keys
 #define PV_N_TILES  (BN / 8)      // 16 n-tiles of O, 8 head-dim cols each
 
 constexpr size_t Q_ELES = BM * BN;
 constexpr size_t K_ELES = 2 * BK * BN;
 constexpr size_t V_ELES = 2 * BK * BN;
+
+// Byte deltas used to walk the precomputed shared-memory addresses. Advancing by
+// whole 8-row groups leaves row % 8 unchanged, so the swizzle is invariant and the
+// delta is a plain constant.
+constexpr uint32_t KV_BUF_BYTES = BK * BN * sizeof(half);   // one double-buffer stage
+constexpr uint32_t K_N_BYTES    = 8 * BN * sizeof(half);    // one K n-tile = 8 key rows
+constexpr uint32_t ROW16_BYTES  = 16 * BN * sizeof(half);   // one cp_async row group
 
 // P never reaches shared memory, so there is no sP staging buffer here.
 constexpr size_t SMEM_BYTES = (Q_ELES + K_ELES + V_ELES) * sizeof(half);
@@ -143,7 +148,6 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     half* sK = sQ + Q_ELES;
     half* sV = sK + K_ELES;
 
-    // grid.x selects the (batch, head) plane; each plane is an independent problem.
     const size_t q_plane  = (size_t)blockIdx.x * d_M * d_N;
     const size_t kv_plane = (size_t)blockIdx.x * d_K * d_N;
     Q += q_plane; out += q_plane;
@@ -162,7 +166,6 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     // into the QK scale runs the entire softmax in base 2 at no cost.
     const float attn_scale = rsqrtf((float)d_N) * 1.4426950408889634f;
 
-    // 16 threads cover one 128-wide row at 8 halves each -> 16 rows per pass.
     const int load_row = tid / 16;
     const int load_col = (tid % 16) * 8;
 
@@ -172,16 +175,57 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
                      &Q[(size_t)(BM * blockIdx.y + load_row + i * 16) * d_N + load_col]);
     }
 
-    cp_async_128(swizzled_ptr(sK, load_row,      load_col, BN), &K[(size_t)load_row * d_N + load_col]);
-    cp_async_128(swizzled_ptr(sK, load_row + 16, load_col, BN), &K[(size_t)(load_row + 16) * d_N + load_col]);
-    cp_async_128(swizzled_ptr(sV, load_row,      load_col, BN), &V[(size_t)load_row * d_N + load_col]);
-    cp_async_128(swizzled_ptr(sV, load_row + 16, load_col, BN), &V[(size_t)(load_row + 16) * d_N + load_col]);
+    // Precomputing part of the smem swizzle so we don't have to calculate it a billion times (stall wait was an issue in prev profiling)
+    // Every tile is read with row % 8 == lane % 8, so the XOR swizzle depends only on
+    // the column. That splits the two operands:
+    //   K: n walks key *rows*, which the swizzle never touches, so advancing n is a
+    //      constant byte delta and only the 8 k-steps need a base.
+    //   V: n walks head-dim *columns*, which is exactly the swizzled axis, so n stays
+    //      inside the XOR and only the row base can be hoisted.
+    // The store side is loop invariant apart from the buffer toggle.
+    const uint32_t sK_base = cvta_generic_to_shared(sK);
+    const uint32_t sV_base = cvta_generic_to_shared(sV);
+    const int lane_s = lane % 8;
+
+    const uint32_t dst_k0 = swizzled_ptr(sK, load_row, load_col, BN);
+    const uint32_t dst_v0 = swizzled_ptr(sV, load_row, load_col, BN);
+
+    uint32_t k_addr[QK_K_STEPS];
+    #pragma unroll
+    for (int k = 0; k < QK_K_STEPS; ++k) {
+        const int chunk = k * 2 + ((lane / 8) % 2);
+        k_addr[k] = sK_base + (uint32_t)(lane_s * BN + (chunk ^ lane_s) * 8) * sizeof(half);
+    }
+
+    uint32_t v_addr[PV_K_STEPS];
+    #pragma unroll
+    for (int k = 0; k < PV_K_STEPS; ++k) {
+        v_addr[k] = sV_base + (uint32_t)((k * 16 + (lane % 16)) * BN) * sizeof(half);
+    }
+
+    // The V column index is the swizzled axis, so its byte delta is a per-lane XOR
+    // rather than a constant. Precomputing all 16 turns each address into one add.
+    uint32_t v_off[PV_N_TILES];
+    #pragma unroll
+    for (int n = 0; n < PV_N_TILES; ++n) {
+        v_off[n] = (uint32_t)((n ^ lane_s) << 4);
+    }
+
+    // Global side: the k-tile advances by a fixed row stride, so walk pointers
+    // instead of recomputing a full index every iteration.
+    const half* k_src = K + (size_t)load_row * d_N + load_col;
+    const half* v_src = V + (size_t)load_row * d_N + load_col;
+    const int   src_row16 = 16 * d_N;
+    const int   src_tile  = BK * d_N;
+
+    #pragma unroll
+    for (int i = 0; i < BK / 16; ++i) {
+        cp_async_128(dst_k0 + i * ROW16_BYTES, k_src + i * src_row16);
+        cp_async_128(dst_v0 + i * ROW16_BYTES, v_src + i * src_row16);
+    }
     cp_async_commit_group(); cp_async_wait_group<0>(); __syncthreads();
 
-    // Q is invariant across the whole K/V stream, so it is read from shared memory
-    // exactly once. That removes ~1/4 of all ldmatrix instructions (and the widest
-    // ones). The 32 extra registers are free: at 256 threads anything up to 255
-    // registers/thread still yields exactly one block per SM.
+    // loading Q into regs to keep forever (we have enough regs to do this)
     uint32_t rQ[QK_K_STEPS][4];
     #pragma unroll
     for (int k = 0; k < QK_K_STEPS; ++k) {
@@ -197,32 +241,30 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
 
         if (has_next) {
             write ^= 1;
-            half* sK_w = sK + write * BK * BN;
-            half* sV_w = sV + write * BK * BN;
-            cp_async_128(swizzled_ptr(sK_w, load_row,      load_col, BN), &K[(size_t)(next + load_row) * d_N + load_col]);
-            cp_async_128(swizzled_ptr(sK_w, load_row + 16, load_col, BN), &K[(size_t)(next + load_row + 16) * d_N + load_col]);
-            cp_async_128(swizzled_ptr(sV_w, load_row,      load_col, BN), &V[(size_t)(next + load_row) * d_N + load_col]);
-            cp_async_128(swizzled_ptr(sV_w, load_row + 16, load_col, BN), &V[(size_t)(next + load_row + 16) * d_N + load_col]);
+            const uint32_t buf_w = write * KV_BUF_BYTES;
+            k_src += src_tile; v_src += src_tile;
+            #pragma unroll
+            for (int i = 0; i < BK / 16; ++i) {
+                cp_async_128(dst_k0 + buf_w + i * ROW16_BYTES, k_src + i * src_row16);
+                cp_async_128(dst_v0 + buf_w + i * ROW16_BYTES, v_src + i * src_row16);
+            }
             cp_async_commit_group();
         }
 
-        const half* sK_r = sK + read * BK * BN;
-        const half* sV_r = sV + read * BK * BN;
+        const uint32_t buf_r = read * KV_BUF_BYTES;
 
-        // ---- S = Q * K^T ----------------------------------------------------
         float scores[QK_N_TILES * 4] = {0.0f};
 
         #pragma unroll
         for (int k = 0; k < QK_K_STEPS; ++k) {
-            // All four B fragments are issued before the first dependent mma so the
-            // MIO pipe stays busy; a 1:1 ldmatrix/mma interleave stalls on every step.
+            // Every B fragment is issued before the first dependent mma so the MIO
+            // pipe stays busy; a 1:1 ldmatrix/mma interleave stalls on every step.
             uint32_t rK[QK_N_TILES][2];
             #pragma unroll
             for (int n = 0; n < QK_N_TILES; ++n) {
                 // K is row-major [key][head]; mma wants B column-major over (head, key),
                 // which is the same bytes, so no transpose is needed here.
-                ld_matrix_x2(rK[n], swizzled_ptr(sK_r, n * 8 + (lane % 8),
-                                                 k * 16 + ((lane / 8) % 2) * 8, BN));
+                ld_matrix_x2(rK[n], k_addr[k] + n * K_N_BYTES + buf_r);
             }
             #pragma unroll
             for (int n = 0; n < QK_N_TILES; ++n) {
@@ -233,16 +275,18 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
         // ---- online softmax --------------------------------------------------
         // Lane L owns C-fragment rows L/4 and L/4 + 8; regs 0,1 belong to the first
         // row and regs 2,3 to the second, hence the two independent running stats.
+        // The scale is never applied to S directly. Since attn_scale > 0,
+        // max(s*c) == c*max(s), so the max is taken on raw scores and scaled once;
+        // the per-element scaling then folds into the exponent's FFMA below. That
+        // turns 2*QK_N_TILES*4 separate multiplies and subtracts into FFMAs.
         float local_max[2] = {-FLT_MAX, -FLT_MAX};
         #pragma unroll
         for (int n = 0; n < QK_N_TILES; ++n) {
-            scores[n * 4 + 0] *= attn_scale; scores[n * 4 + 1] *= attn_scale;
-            scores[n * 4 + 2] *= attn_scale; scores[n * 4 + 3] *= attn_scale;
             local_max[0] = fmaxf(local_max[0], fmaxf(scores[n * 4 + 0], scores[n * 4 + 1]));
             local_max[1] = fmaxf(local_max[1], fmaxf(scores[n * 4 + 2], scores[n * 4 + 3]));
         }
-        local_max[0] = max_reduction(local_max[0]);
-        local_max[1] = max_reduction(local_max[1]);
+        local_max[0] = max_reduction(local_max[0]) * attn_scale;
+        local_max[1] = max_reduction(local_max[1]) * attn_scale;
 
         const float new_m0 = fmaxf(m_row[0], local_max[0]);
         const float new_m1 = fmaxf(m_row[1], local_max[1]);
@@ -260,10 +304,10 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
         float tile_sum[2] = {0.0f, 0.0f};
         #pragma unroll
         for (int n = 0; n < QK_N_TILES; ++n) {
-            scores[n * 4 + 0] = exp2f(scores[n * 4 + 0] - m_row[0]);
-            scores[n * 4 + 1] = exp2f(scores[n * 4 + 1] - m_row[0]);
-            scores[n * 4 + 2] = exp2f(scores[n * 4 + 2] - m_row[1]);
-            scores[n * 4 + 3] = exp2f(scores[n * 4 + 3] - m_row[1]);
+            scores[n * 4 + 0] = exp2f(fmaf(scores[n * 4 + 0], attn_scale, -m_row[0]));
+            scores[n * 4 + 1] = exp2f(fmaf(scores[n * 4 + 1], attn_scale, -m_row[0]));
+            scores[n * 4 + 2] = exp2f(fmaf(scores[n * 4 + 2], attn_scale, -m_row[1]));
+            scores[n * 4 + 3] = exp2f(fmaf(scores[n * 4 + 3], attn_scale, -m_row[1]));
             tile_sum[0] += scores[n * 4 + 0] + scores[n * 4 + 1];
             tile_sum[1] += scores[n * 4 + 2] + scores[n * 4 + 3];
         }
@@ -299,8 +343,7 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
                 for (int j = 0; j < 4; ++j) {
                     // V is row-major [key][head] but mma wants B column-major over
                     // (key, head); the transposing ldmatrix does that for free.
-                    ld_matrix_x2_trans(rV[j], swizzled_ptr(sV_r, k * 16 + (lane % 16),
-                                                           (nb * 4 + j) * 8, BN));
+                    ld_matrix_x2_trans(rV[j], v_addr[k] + v_off[nb * 4 + j] + buf_r);
                 }
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -382,7 +425,9 @@ static void reference_row(const half* Q, const half* K, const half* V, float* o_
 int main() {
     // No boundary masking in the kernel, so the shapes must tile exactly:
     //   seq % BM == 0 (queries), seq % BK == 0 (keys), d_head == BN.
-    const int planes = 12;     // batch * heads -> grid.x
+    // 14 * (2048/128) = 224 blocks = exactly 4 waves on 56 SMs, so no partial-wave
+    // tail contaminates the measurement.
+    const int planes = 14;     // batch * heads -> grid.x
     const int seq    = 2048;   // queries and keys/values
     const int d_head = BN;     // 128
 
