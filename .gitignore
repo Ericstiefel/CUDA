@@ -1,5 +1,9 @@
-matrix_profiler.exe
-matrix_profiler.exp
-matrix_profiler.lib
+*.exe
+*.exp
+*.lib
+*.nsys-rep
+*.ncu-rep
+*.sqlite
 reports/
 term.txt
+*.pdf
