@@ -80,7 +80,7 @@ __device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], 
 // Tune these, for max arithmetic intensity on matmul, M & N >> K (K Doesn't contribute).
 
 // A MxK, B KxN.
-__global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, float* __restrict__ C, const int M, const int K, const int N) {
+__global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, const int M, const int K, const int N) {
     __shared__ half sA[2][BM][BK];
     __shared__ half sB[2][BK][BN];
 
@@ -217,10 +217,12 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, flo
             int global_row = block_global_row + frag_row;
             int global_col = block_global_col + frag_col;
 
-            C[global_row * N + global_col] = rC[m][n][0];
-            C[global_row * N + global_col + 1] = rC[m][n][1];
-            C[(global_row + 8) * N + global_col] = rC[m][n][2];
-            C[(global_row + 8) * N + global_col + 1] = rC[m][n][3];
+            // Accumulation stays fp32 the whole way down; the narrowing happens once,
+            // here, so the next kernel in the chain can consume C as half directly.
+            C[global_row * N + global_col] = static_cast<half>(rC[m][n][0]);
+            C[global_row * N + global_col + 1] = static_cast<half>(rC[m][n][1]);
+            C[(global_row + 8) * N + global_col] = static_cast<half>(rC[m][n][2]);
+            C[(global_row + 8) * N + global_col + 1] = static_cast<half>(rC[m][n][3]);
         }
     }
 
@@ -245,15 +247,15 @@ int main() {
     int N = 4096;
     int K = 1024;
 
-    half *h_A, *h_B; float* h_C;
+    half *h_A, *h_B, *h_C;
     CUDA_CHECK(cudaMallocHost(&h_A, sizeof(half) * M * K));
     CUDA_CHECK(cudaMallocHost(&h_B, sizeof(half) * K * N));
-    CUDA_CHECK(cudaMallocHost(&h_C, sizeof(float) * M * N));
+    CUDA_CHECK(cudaMallocHost(&h_C, sizeof(half) * M * N));
 
-    half *d_A, *d_B; float* d_C;
+    half *d_A, *d_B, *d_C;
     CUDA_CHECK(cudaMalloc(&d_A, sizeof(half) * M * K));
     CUDA_CHECK(cudaMalloc(&d_B, sizeof(half) * K * N));
-    CUDA_CHECK(cudaMalloc(&d_C, sizeof(float) * M * N));
+    CUDA_CHECK(cudaMalloc(&d_C, sizeof(half) * M * N));
 
 
     for (int m = 0; m < M; ++m) {
@@ -292,7 +294,7 @@ int main() {
     CUDA_CHECK(cudaProfilerStop());
 
 
-    CUDA_CHECK(cudaMemcpy(h_C, d_C, sizeof(float) * M * N, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_C, d_C, sizeof(half) * M * N, cudaMemcpyDeviceToHost));
 
     CUDA_CHECK(cudaGetLastError());
 
