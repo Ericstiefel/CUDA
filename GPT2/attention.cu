@@ -7,93 +7,14 @@
 // built around two ideas: keep loop-invariant operands in registers, and always have
 // several ldmatrix in flight before the dependent mma issues.
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "common.cuh"
 #include <cuda_profiler_api.h>
 #include <cmath>
 #include <cfloat>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 
 
-__device__ __forceinline__ uint32_t cvta_generic_to_shared(const void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(const_cast<void*>(ptr)));
-}
-
-
-__device__ __forceinline__ uint32_t swizzled_ptr(const void* smem_ptr, int row, int col, int stride) {
-    int eles_per_vec = 16 / (int)sizeof(half);
-    int vecs_per_row = stride / eles_per_vec;
-
-    int chunk_idx = col / eles_per_vec;
-    int offset = col % eles_per_vec;
-
-    int swizzled_chunk = chunk_idx ^ ((row % 8) % vecs_per_row);
-    int flat_idx = (row * stride) + (swizzled_chunk * eles_per_vec) + offset;
-    return cvta_generic_to_shared(static_cast<const half*>(smem_ptr) + flat_idx);
-}
-
-__device__ __forceinline__ void cp_async_128(uint32_t smem_ptr, const void* gmem_ptr) {
-    asm volatile (
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :: "r"(smem_ptr), "l"(gmem_ptr)
-    );
-}
-
-__device__ __forceinline__ void cp_async_commit_group() {
-    asm volatile ("cp.async.commit_group;\n");
-}
-
-template <int N> // availability at runtime
-__device__ __forceinline__ void cp_async_wait_group() {
-    asm volatile ("cp.async.wait_group %0;\n" :: "n"(N));
-}
-
-// volatile is kept on every ldmatrix: without it the compiler may CSE a load across
-// __syncthreads, and the double-buffered K/V addresses repeat every two iterations
-// while the data underneath them does not. Operand reuse is done structurally instead.
-__device__ __forceinline__ void ld_matrix_x4(uint32_t rA[4], uint32_t smem_ptr) {
-    asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(rA[0]), "=r"(rA[1]), "=r"(rA[2]), "=r"(rA[3])
-        : "r"(smem_ptr)
-    );
-}
-
-__device__ __forceinline__ void ld_matrix_x2(uint32_t rB[2], uint32_t smem_ptr) {
-    asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(rB[0]), "=r"(rB[1])
-        : "r"(smem_ptr)
-    );
-}
-
-__device__ __forceinline__ void ld_matrix_x2_trans(uint32_t rB[2], uint32_t smem_ptr) {
-    asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(rB[0]), "=r"(rB[1])
-        : "r"(smem_ptr)
-    );
-}
-
-__device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], float rC[4]) {
-    asm volatile (
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
-        " {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-        : "+f"(rC[0]), "+f"(rC[1]), "+f"(rC[2]), "+f"(rC[3])
-        : "r"(rA[0]), "r"(rA[1]), "r"(rA[2]), "r"(rA[3]),
-        "r"(rB[0]), "r"(rB[1])
-    );
-}
-
-// Two floats -> one packed half2 register. F2FP.PACK_AB, single instruction on sm_80+.
-__device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
-    __half2 h = __floats2half2_rn(lo, hi);
-    return *reinterpret_cast<const uint32_t*>(&h);
-}
-
-
+// Width-4 butterflies: the four lanes sharing a C-fragment row hold the eight columns of
+// one n-tile group, so the reduction stops there rather than spanning the warp.
 __device__ __forceinline__ float max_reduction(float val) {
     unsigned mask = 0xffffffff;
     #pragma unroll
@@ -113,17 +34,21 @@ __device__ __forceinline__ float sum_reduction(float sum) {
 }
 
 
-#define BM 128   // Q rows per block tile
-#define BN 128   // head dim, also the smem row stride
-#define BK 64    // K/V rows (keys) per streamed tile
+// Anonymous namespace, not macros: BM/BN/BK and WARPS all mean something different in
+// gemm.cu and softmax.cu, and internal linkage keeps them from ever meeting.
+namespace {
+constexpr int BM = 128;   // Q rows per block tile
+constexpr int BN = 128;   // head dim, also the smem row stride
+constexpr int BK = 64;    // K/V rows (keys) per streamed tile
 
-#define WARPS   8
-#define WARP_M  (BM / WARPS)      // 16 Q rows per warp -> one m16 mma tile
+constexpr int WARPS  = 8;
+constexpr int WARP_M = BM / WARPS;      // 16 Q rows per warp -> one m16 mma tile
 
-#define QK_K_STEPS  (BN / 16)     // 8 reduction steps over head dim
-#define QK_N_TILES  (BK / 8)      // n-tiles of S, 8 keys each
-#define PV_K_STEPS  (BK / 16)     // reduction steps over keys
-#define PV_N_TILES  (BN / 8)      // 16 n-tiles of O, 8 head-dim cols each
+constexpr int QK_K_STEPS = BN / 16;     // 8 reduction steps over head dim
+constexpr int QK_N_TILES = BK / 8;      // n-tiles of S, 8 keys each
+constexpr int PV_K_STEPS = BK / 16;     // reduction steps over keys
+constexpr int PV_N_TILES = BN / 8;      // 16 n-tiles of O, 8 head-dim cols each
+}
 
 constexpr size_t Q_ELES = BM * BN;
 constexpr size_t K_ELES = 2 * BK * BN;
@@ -235,9 +160,22 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
 
     int write = 0, read = 0;
 
-    for (int tile_k = 0; tile_k < d_K; tile_k += BK) {
+    // ---- causal bounds ---------------------------------------------------------
+    // This block owns queries [q_tile_lo, q_tile_lo + BM), so every key from
+    // q_tile_lo + BM onward is in the future for all of them. Those tiles are not
+    // masked, they are never streamed: the loop simply stops. That is where the
+    // triangle actually pays -- roughly half the K/V traffic and half the mmas.
+    const int q_tile_lo = BM * (int)blockIdx.y;
+    const int k_end     = (q_tile_lo + BM < d_K) ? (q_tile_lo + BM) : d_K;
+
+    // Per-element masking is only needed on tiles that reach past this warp's first
+    // query row; anything wholly below the diagonal is fully visible. The test is
+    // warp-uniform, so the branch costs nothing on an issue-bound kernel.
+    const int q_warp_lo = q_tile_lo + warp_row;
+
+    for (int tile_k = 0; tile_k < k_end; tile_k += BK) {
         const int next = tile_k + BK;
-        const bool has_next = next < d_K;
+        const bool has_next = next < k_end;
 
         if (has_next) {
             write ^= 1;
@@ -269,6 +207,31 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
             #pragma unroll
             for (int n = 0; n < QK_N_TILES; ++n) {
                 mma(rQ[k], rK[n], &scores[n * 4]);
+            }
+        }
+
+        // ---- causal mask -----------------------------------------------------
+        // Same C-fragment layout the P repack below relies on: for n-tile n,
+        //   regs 0,1 -> query row (lane/4),     keys 8n + 2*(lane%4) + {0,1}
+        //   regs 2,3 -> query row (lane/4) + 8, the same two keys
+        // A key strictly greater than its query is unseen, so it is driven to
+        // -FLT_MAX. The max reduction then ignores it and the exp2f below returns
+        // exactly 0, which leaves l_row and acc untouched -- no separate bookkeeping
+        // for "this row saw nothing in this tile" is needed.
+        //
+        // A row can never end up with an empty softmax: tile 0 always contains key 0,
+        // and every query can see key 0, so l_row is strictly positive by the time the
+        // epilogue divides by it.
+        if (tile_k + BK - 1 > q_warp_lo) {
+            const int q_lo = q_warp_lo + (lane / 4);
+            const int k_lo = tile_k + (lane % 4) * 2;
+            #pragma unroll
+            for (int n = 0; n < QK_N_TILES; ++n) {
+                const int k = k_lo + n * 8;
+                if (k     > q_lo)     scores[n * 4 + 0] = -FLT_MAX;
+                if (k + 1 > q_lo)     scores[n * 4 + 1] = -FLT_MAX;
+                if (k     > q_lo + 8) scores[n * 4 + 2] = -FLT_MAX;
+                if (k + 1 > q_lo + 8) scores[n * 4 + 3] = -FLT_MAX;
             }
         }
 
@@ -377,14 +340,7 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     }
 }
 
-#define CUDA_CHECK(call) do{ \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA Error %s:%d: %s \n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while (0)
-
+#ifndef GPT2_NO_MAIN
 
 // Reference attention for a single output row, used to spot-check the kernel.
 static void reference_row(const half* Q, const half* K, const half* V, float* o_row,
@@ -397,8 +353,9 @@ static void reference_row(const half* Q, const half* K, const half* V, float* o_
     const float scale = 1.0f / sqrtf((float)d_head);
     float* s = (float*)malloc(sizeof(float) * seq);
 
+    // Causal: row r attends to keys 0..r inclusive and nothing beyond.
     float m = -FLT_MAX;
-    for (int j = 0; j < seq; ++j) {
+    for (int j = 0; j <= row; ++j) {
         float dot = 0.0f;
         for (int c = 0; c < d_head; ++c) {
             dot += __half2float(q[c]) * __half2float(k[(size_t)j * d_head + c]);
@@ -409,7 +366,7 @@ static void reference_row(const half* Q, const half* K, const half* V, float* o_
 
     float l = 0.0f;
     for (int c = 0; c < d_head; ++c) o_row[c] = 0.0f;
-    for (int j = 0; j < seq; ++j) {
+    for (int j = 0; j <= row; ++j) {
         const float p = expf(s[j] - m);
         l += p;
         for (int c = 0; c < d_head; ++c) {
@@ -520,3 +477,5 @@ int main() {
 
     return 0;
 }
+
+#endif // GPT2_NO_MAIN

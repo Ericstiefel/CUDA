@@ -1,81 +1,15 @@
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "common.cuh"
 #include <cuda_profiler_api.h>
 #include <cmath>
 #include <cfloat>
-#include <cstdio>
-#include <cstdlib>
 
-__device__ __forceinline__ uint32_t smem_ptr_to_uint(const void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+// Anonymous namespace, not macros: BK is 64 in attention.cu and these names would
+// otherwise collide the moment a driver pulls both in.
+namespace {
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 32;
 }
-
-__device__ __forceinline__ uint32_t swizzle_addr(const half* base_smem, int row, int col, int stride) {
-    int vals_per_vec = 16 / sizeof(half); // 8 2 byte half values fit inside 1 transfer 16 byte load
-    int vecs_per_row = stride / vals_per_vec;
-
-    int chunk_idx = col / vals_per_vec;
-    int offset = col % vals_per_vec;
-
-    int swizzled_col = chunk_idx ^ ((row % 8) % vecs_per_row);
-    int flat_idx = row * stride + swizzled_col * vals_per_vec + offset;
-    return smem_ptr_to_uint(base_smem + flat_idx);
-}
-
-
-__device__ __forceinline__ void cp_async_128(uint32_t smem_addr, const void* gmem_ptr) { // gmem -> smem async
-    asm volatile (
-        "cp.async.cg.shared.global [%0], [%1], 16;\n" 
-        :: "r"(smem_addr), "l"(gmem_ptr)
-    );
-}
-
-__device__ __forceinline__ void cp_async_commit_group() {
-    asm volatile (
-        "cp.async.commit_group;\n"
-    );
-}
-
-template <int N> // must be available at runtime
-__device__ __forceinline__ void cp_async_wait_group() {
-    asm volatile ("cp.async.wait_group %0;\n"
-    :: "n"(N) );
-}
-
-// b16 for 16 bits per element
-__device__ __forceinline__ void ld_matrix_x4(uint32_t regs[4], uint32_t smem_addr) {
-    asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(regs[0]), "=r"(regs[1]), "=r"(regs[2]), "=r"(regs[3])
-        : "r"(smem_addr) 
-    );
-}
-
-__device__ __forceinline__ void ld_matrix_x2(uint32_t regs[2], uint32_t smem_addr) {
-    asm volatile (
-        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-        : "=r"(regs[0]), "=r"(regs[1])
-        : "r"(smem_addr)
-    );
-}
-
-__device__ __forceinline__ void mma(const uint32_t rA[4], const uint32_t rB[2], float rC[4]) {
-    asm volatile (
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, "
-        "{%4, %5, %6, %7}, "
-        "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-
-        :"+f"(rC[0]), "+f"(rC[1]), "+f"(rC[2]), "+f"(rC[3])
-        : "r"(rA[0]), "r"(rA[1]), "r"(rA[2]), "r"(rA[3]),
-        "r"(rB[0]), "r"(rB[1])
-    );
-}
-
-#define BM 128
-#define BN 128 
-#define BK 32
 
 // Tune these, for max arithmetic intensity on matmul, M & N >> K (K Doesn't contribute).
 
@@ -101,13 +35,13 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
     int write_stage = 0; int read_stage = 0;
 
-    uint32_t smem_A_p1 = swizzle_addr(&sA[0][0][0], tid / 4, (tid / 4) * 8, BK);
-    uint32_t smem_A_p2 = swizzle_addr(&sA[0][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
+    uint32_t smem_A_p1 = swizzled_ptr(&sA[0][0][0], tid / 4, (tid / 4) * 8, BK);
+    uint32_t smem_A_p2 = swizzled_ptr(&sA[0][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
     cp_async_128(smem_A_p1, &A[load_A_row * K + load_A_col]);
     cp_async_128(smem_A_p2, &A[(load_A_row + 64) * K + load_A_col]);
 
-    uint32_t smem_B_p1 = swizzle_addr(&sB[0][0][0], tid / 16, (tid % 16) * 8, BN);
-    uint32_t smem_B_p2 = swizzle_addr(&sB[0][0][0], tid / 16 + 16, (tid % 16) * 8, BN);
+    uint32_t smem_B_p1 = swizzled_ptr(&sB[0][0][0], tid / 16, (tid % 16) * 8, BN);
+    uint32_t smem_B_p2 = swizzled_ptr(&sB[0][0][0], tid / 16 + 16, (tid % 16) * 8, BN);
     cp_async_128(smem_B_p1, &B[load_B_row * N + load_B_col]);
     cp_async_128(smem_B_p2, &B[(load_B_row + 16) * N + load_B_col]);
 
@@ -121,13 +55,13 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
         // preload next set of tiles
         write_stage ^= 1;
 
-        uint32_t smem_A_p1 = swizzle_addr(&sA[write_stage][0][0], tid / 4, (tid / 4) * 8, BK);
-        uint32_t smem_A_p2 = swizzle_addr(&sA[write_stage][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
+        uint32_t smem_A_p1 = swizzled_ptr(&sA[write_stage][0][0], tid / 4, (tid / 4) * 8, BK);
+        uint32_t smem_A_p2 = swizzled_ptr(&sA[write_stage][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
         cp_async_128(smem_A_p1, &A[load_A_row * K + load_A_col + tile_k]);
         cp_async_128(smem_A_p2, &A[(load_A_row + 64) * K + load_A_col + tile_k]);
 
-        uint32_t smem_B_p1 = swizzle_addr(&sB[write_stage][0][0], tid / 16, (tid % 16) * 8, BN);
-        uint32_t smem_B_p2 = swizzle_addr(&sB[write_stage][0][0], tid / 16 + 16, (tid % 16) * 8, BN);
+        uint32_t smem_B_p1 = swizzled_ptr(&sB[write_stage][0][0], tid / 16, (tid % 16) * 8, BN);
+        uint32_t smem_B_p2 = swizzled_ptr(&sB[write_stage][0][0], tid / 16 + 16, (tid % 16) * 8, BN);
         cp_async_128(smem_B_p1, &B[load_B_row * N + load_B_col + tile_k * N]);
         cp_async_128(smem_B_p2, &B[(load_B_row + 16) * N + load_B_col + tile_k * N]);
 
@@ -146,7 +80,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
                 a_col = (lane_group == 0 || lane_group == 1) ? k_dim * 16 : k_dim * 16 + 8;
 
-                uint32_t smem_read_A = swizzle_addr(&sA[read_stage][0][0], a_row, a_col, BK);
+                uint32_t smem_read_A = swizzled_ptr(&sA[read_stage][0][0], a_row, a_col, BK);
                 ld_matrix_x4(rA, smem_read_A);
 
                 for (int n_dim = 0; n_dim < 4; ++n_dim) {
@@ -156,7 +90,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
                     b_col = warp_col_offset + n_dim * 8;
 
-                    uint32_t smem_read_B = swizzle_addr(&sB[read_stage][0][0], b_row, b_col, BN);
+                    uint32_t smem_read_B = swizzled_ptr(&sB[read_stage][0][0], b_row, b_col, BN);
                     ld_matrix_x2(rB, smem_read_B);
                     mma(rA, rB, rC[m_dim][n_dim]);
                 }
@@ -183,7 +117,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
             a_col = (lane_group == 0 || lane_group == 1) ? k_dim * 16 : k_dim * 16 + 8;
 
-            uint32_t smem_read_A = swizzle_addr(&sA[read_stage][0][0], a_row, a_col, BK);
+            uint32_t smem_read_A = swizzled_ptr(&sA[read_stage][0][0], a_row, a_col, BK);
             ld_matrix_x4(rA, smem_read_A);
 
             for (int n_dim = 0; n_dim < 4; ++n_dim) {
@@ -193,7 +127,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
                 b_col = warp_col_offset + n_dim * 8;
 
-                uint32_t smem_read_B = swizzle_addr(&sB[read_stage][0][0], b_row, b_col, BN);
+                uint32_t smem_read_B = swizzled_ptr(&sB[read_stage][0][0], b_row, b_col, BN);
                 ld_matrix_x2(rB, smem_read_B);
                 mma(rA, rB, rC[m_dim][n_dim]);
             }
@@ -229,15 +163,7 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
 
 }
 
-#define CUDA_CHECK(call) do{ \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA Error %s:%d: %s \n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(1); \
-    } \
-} while (0)
-
-
+#ifndef GPT2_NO_MAIN
 
 int main() {
     // Grab at least one of the dims of the matmuls we're going to use the matmul for.
@@ -314,3 +240,5 @@ int main() {
 
     return 0;
 }
+
+#endif // GPT2_NO_MAIN

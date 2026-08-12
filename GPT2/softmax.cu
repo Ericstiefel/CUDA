@@ -2,37 +2,30 @@
 
 // This will not work for alternative sizes, curated specifically for our inference purposes.
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include "common.cuh"
 #include <cuda_profiler_api.h>
 #include <cmath>
 #include <cfloat>
-#include <cstdio>
-#include <cstdlib>
 
-#define MASK 0xffffffffu
-
-#define BLOCK 1024              // threads per block, one block per row
-#define WARPS (BLOCK / 32)      // 32, which is exactly the lane count of one warp
-#define VPT   7                 // float4s per thread; 1024 * 7 * 8 = 57344 > 50304
-
-
-__device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
-    __half2 h = __floats2half2_rn(lo, hi);
-    return *reinterpret_cast<const uint32_t*>(&h);
+// Anonymous namespace so these names stay local to this translation unit; WARPS in
+// particular means something different in attention.cu.
+namespace {
+constexpr int BLOCK = 1024;         // threads per block, one block per row
+constexpr int WARPS = BLOCK / 32;   // 32, which is exactly the lane count of one warp
+constexpr int VPT   = 7;            // float4s per thread; 1024 * 7 * 8 = 57344 > 50304
 }
 
 // Butterfly rather than shfl_down: every lane ends up holding the result, so the block
 // reduction below needs no broadcast step.
 __device__ __forceinline__ float warp_max(float v) {
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(MASK, v, off));
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(FULL_MASK, v, off));
     return v;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(MASK, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(FULL_MASK, v, off);
     return v;
 }
 
@@ -118,14 +111,7 @@ __global__ void softmax(const half* __restrict__ inp, half* __restrict__ out,
 }
 
 
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-    fprintf(stderr, "CUDA Error %s:%d: %s \n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-    exit(1); \
-    } \
-} while (0)
-
+#ifndef GPT2_NO_MAIN
 
 static void reference_row(const half* inp, float* probs, int row, int N, int V) {
     const half* r = inp + (size_t)row * N;
@@ -223,3 +209,5 @@ int main() {
 
     return 0;
 }
+
+#endif // GPT2_NO_MAIN
