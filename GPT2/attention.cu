@@ -7,9 +7,8 @@
 // built around two ideas: keep loop-invariant operands in registers, and always have
 // several ldmatrix in flight before the dependent mma issues.
 
-#include "common.cuh"
+#include "kernels.cuh"
 #include <cuda_profiler_api.h>
-#include <cmath>
 #include <cfloat>
 
 
@@ -34,49 +33,38 @@ __device__ __forceinline__ float sum_reduction(float sum) {
 }
 
 
-// Anonymous namespace, not macros: BM/BN/BK and WARPS all mean something different in
-// gemm.cu and softmax.cu, and internal linkage keeps them from ever meeting.
-namespace {
-constexpr int BM = 128;   // Q rows per block tile
-constexpr int BN = 128;   // head dim, also the smem row stride
-constexpr int BK = 64;    // K/V rows (keys) per streamed tile
-
-constexpr int WARPS  = 8;
-constexpr int WARP_M = BM / WARPS;      // 16 Q rows per warp -> one m16 mma tile
-
-constexpr int QK_K_STEPS = BN / 16;     // 8 reduction steps over head dim
-constexpr int QK_N_TILES = BK / 8;      // n-tiles of S, 8 keys each
-constexpr int PV_K_STEPS = BK / 16;     // reduction steps over keys
-constexpr int PV_N_TILES = BN / 8;      // 16 n-tiles of O, 8 head-dim cols each
-}
-
-constexpr size_t Q_ELES = BM * BN;
-constexpr size_t K_ELES = 2 * BK * BN;
-constexpr size_t V_ELES = 2 * BK * BN;
+// Tile sizes and the shared-memory budget live in kernels.cuh, since the driver needs
+// them to size the launch. BK here is 64; gemm_cfg::BK is 32, which is exactly why they
+// are namespaced rather than macros.
+using namespace attn;
 
 // Byte deltas used to walk the precomputed shared-memory addresses. Advancing by
 // whole 8-row groups leaves row % 8 unchanged, so the swizzle is invariant and the
-// delta is a plain constant.
+// delta is a plain constant. Purely internal, so they stay here.
 constexpr uint32_t KV_BUF_BYTES = BK * BN * sizeof(half);   // one double-buffer stage
 constexpr uint32_t K_N_BYTES    = 8 * BN * sizeof(half);    // one K n-tile = 8 key rows
 constexpr uint32_t ROW16_BYTES  = 16 * BN * sizeof(half);   // one cp_async row group
 
-// P never reaches shared memory, so there is no sP staging buffer here.
-constexpr size_t SMEM_BYTES = (Q_ELES + K_ELES + V_ELES) * sizeof(half);
-
 
 __global__ void flash_attention(const half* __restrict__ Q, const half* __restrict__ K,
                                 const half* __restrict__ V, half* __restrict__ out,
-                                int d_M, int d_K, int d_N) {
+                                int d_M, int d_K, int d_N,
+                                int in_row_stride, int out_row_stride,
+                                int in_plane_stride, int out_plane_stride) {
     extern __shared__ half smem[];
     half* sQ = smem;
     half* sK = sQ + Q_ELES;
     half* sV = sK + K_ELES;
 
-    const size_t q_plane  = (size_t)blockIdx.x * d_M * d_N;
-    const size_t kv_plane = (size_t)blockIdx.x * d_K * d_N;
-    Q += q_plane; out += q_plane;
-    K += kv_plane; V += kv_plane;
+    // The row stride is separate from the head dim so the kernel can read straight out
+    // of a packed [T, 3*d_model] QKV buffer (in_row_stride = 3*d_model, plane stride =
+    // d_head, caller offsets K and V by d_model and 2*d_model) as well as out of
+    // per-plane [plane][seq][d_head] tensors (in_row_stride = d_head, plane stride =
+    // seq*d_head). That is what removes the split and merge passes.
+    Q += (size_t)blockIdx.x * in_plane_stride;
+    K += (size_t)blockIdx.x * in_plane_stride;
+    V += (size_t)blockIdx.x * in_plane_stride;
+    out += (size_t)blockIdx.x * out_plane_stride;
 
     const int tid      = threadIdx.x;
     const int warp_id  = tid / 32;
@@ -97,7 +85,7 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
     #pragma unroll
     for (int i = 0; i < BM / 16; ++i) {
         cp_async_128(swizzled_ptr(sQ, load_row + i * 16, load_col, BN),
-                     &Q[(size_t)(BM * blockIdx.y + load_row + i * 16) * d_N + load_col]);
+                     &Q[(size_t)(BM * blockIdx.y + load_row + i * 16) * in_row_stride + load_col]);
     }
 
     // Precomputing part of the smem swizzle so we don't have to calculate it a billion times (stall wait was an issue in prev profiling)
@@ -138,10 +126,10 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
 
     // Global side: the k-tile advances by a fixed row stride, so walk pointers
     // instead of recomputing a full index every iteration.
-    const half* k_src = K + (size_t)load_row * d_N + load_col;
-    const half* v_src = V + (size_t)load_row * d_N + load_col;
-    const int   src_row16 = 16 * d_N;
-    const int   src_tile  = BK * d_N;
+    const half* k_src = K + (size_t)load_row * in_row_stride + load_col;
+    const half* v_src = V + (size_t)load_row * in_row_stride + load_col;
+    const int   src_row16 = 16 * in_row_stride;
+    const int   src_tile  = BK * in_row_stride;
 
     #pragma unroll
     for (int i = 0; i < BK / 16; ++i) {
@@ -335,147 +323,7 @@ __global__ void flash_attention(const half* __restrict__ Q, const half* __restri
         const int col = n * 8 + col_base;
         const __half2 lo = __floats2half2_rn(acc[n * 4 + 0] * inv_l0, acc[n * 4 + 1] * inv_l0);
         const __half2 hi = __floats2half2_rn(acc[n * 4 + 2] * inv_l1, acc[n * 4 + 3] * inv_l1);
-        *reinterpret_cast<__half2*>(&out[(size_t)out_row * d_N + col]) = lo;
-        *reinterpret_cast<__half2*>(&out[(size_t)(out_row + 8) * d_N + col]) = hi;
+        *reinterpret_cast<__half2*>(&out[(size_t)out_row * out_row_stride + col]) = lo;
+        *reinterpret_cast<__half2*>(&out[(size_t)(out_row + 8) * out_row_stride + col]) = hi;
     }
 }
-
-#ifndef GPT2_NO_MAIN
-
-// Reference attention for a single output row, used to spot-check the kernel.
-static void reference_row(const half* Q, const half* K, const half* V, float* o_row,
-                          int plane, int row, int seq, int d_head) {
-    const size_t off = (size_t)plane * seq * d_head;
-    const half* q = Q + off + (size_t)row * d_head;
-    const half* k = K + off;
-    const half* v = V + off;
-
-    const float scale = 1.0f / sqrtf((float)d_head);
-    float* s = (float*)malloc(sizeof(float) * seq);
-
-    // Causal: row r attends to keys 0..r inclusive and nothing beyond.
-    float m = -FLT_MAX;
-    for (int j = 0; j <= row; ++j) {
-        float dot = 0.0f;
-        for (int c = 0; c < d_head; ++c) {
-            dot += __half2float(q[c]) * __half2float(k[(size_t)j * d_head + c]);
-        }
-        s[j] = dot * scale;
-        m = fmaxf(m, s[j]);
-    }
-
-    float l = 0.0f;
-    for (int c = 0; c < d_head; ++c) o_row[c] = 0.0f;
-    for (int j = 0; j <= row; ++j) {
-        const float p = expf(s[j] - m);
-        l += p;
-        for (int c = 0; c < d_head; ++c) {
-            o_row[c] += p * __half2float(v[(size_t)j * d_head + c]);
-        }
-    }
-    for (int c = 0; c < d_head; ++c) o_row[c] /= l;
-
-    free(s);
-}
-
-
-int main() {
-    // No boundary masking in the kernel, so the shapes must tile exactly:
-    //   seq % BM == 0 (queries), seq % BK == 0 (keys), d_head == BN.
-    // 14 * (2048/128) = 224 blocks = exactly 4 waves on 56 SMs, so no partial-wave
-    // tail contaminates the measurement.
-    const int planes = 14;     // batch * heads -> grid.x
-    const int seq    = 2048;   // queries and keys/values
-    const int d_head = BN;     // 128
-
-    const size_t plane_eles = (size_t)seq * d_head;
-    const size_t total_eles = (size_t)planes * plane_eles;
-    const size_t bytes = sizeof(half) * total_eles;
-
-    half *h_Q, *h_K, *h_V, *h_O;
-    CUDA_CHECK(cudaMallocHost(&h_Q, bytes));
-    CUDA_CHECK(cudaMallocHost(&h_K, bytes));
-    CUDA_CHECK(cudaMallocHost(&h_V, bytes));
-    CUDA_CHECK(cudaMallocHost(&h_O, bytes));
-
-    half *d_Q, *d_Kk, *d_V, *d_O;
-    CUDA_CHECK(cudaMalloc(&d_Q, bytes));
-    CUDA_CHECK(cudaMalloc(&d_Kk, bytes));
-    CUDA_CHECK(cudaMalloc(&d_V, bytes));
-    CUDA_CHECK(cudaMalloc(&d_O, bytes));
-
-    for (size_t i = 0; i < total_eles; ++i) {
-        h_Q[i] = static_cast<half>(((i * 7 + 1) % 17) / 19.0f);
-        h_K[i] = static_cast<half>(((i * 5 + 3) % 17) / 21.0f);
-        h_V[i] = static_cast<half>(((i * 3 + 2) % 13) / 23.0f);
-    }
-
-    CUDA_CHECK(cudaMemcpy(d_Q, h_Q, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_Kk, h_K, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_V, h_V, bytes, cudaMemcpyHostToDevice));
-
-    // 64 KB of dynamic smem is over the 48 KB default cap, so it must be opted into.
-    CUDA_CHECK(cudaFuncSetAttribute(flash_attention,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int)SMEM_BYTES));
-
-    dim3 tpb(WARPS * 32);              // 8 warps, one 16-row Q slice each
-    dim3 bpg(planes, seq / BM);        // x -> (batch, head) planes, y -> Q row tiles
-
-    for (int i = 0; i < 50; ++i) {
-        flash_attention<<<bpg, tpb, SMEM_BYTES>>>(d_Q, d_Kk, d_V, d_O, seq, seq, d_head); // warm up
-    }
-
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaProfilerStart());
-
-
-    flash_attention<<<bpg, tpb, SMEM_BYTES>>>(d_Q, d_Kk, d_V, d_O, seq, seq, d_head);
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaProfilerStop());
-
-
-    CUDA_CHECK(cudaMemcpy(h_O, d_O, bytes, cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Spot-check a spread of rows against the CPU reference. fp16 operands with fp32
-    // accumulation over 2048 keys puts the expected relative error around 1e-3.
-    float* ref = (float*)malloc(sizeof(float) * d_head);
-    float max_rel = 0.0f;
-    const int probe_rows[] = {0, 1, 7, 8, 127, 128, 1023, 2047};
-    for (int p = 0; p < planes; p += 5) {
-        for (int r = 0; r < (int)(sizeof(probe_rows) / sizeof(int)); ++r) {
-            const int row = probe_rows[r];
-            reference_row(h_Q, h_K, h_V, ref, p, row, seq, d_head);
-            for (int c = 0; c < d_head; ++c) {
-                const float got = __half2float(h_O[(size_t)p * plane_eles + (size_t)row * d_head + c]);
-                const float rel = fabsf(got - ref[c]) / fmaxf(fabsf(ref[c]), 1e-6f);
-                max_rel = fmaxf(max_rel, rel);
-            }
-        }
-    }
-    printf("max relative error vs reference: %.5f  (%s)\n",
-           max_rel, max_rel < 2e-2f ? "PASS" : "FAIL");
-    free(ref);
-
-    CUDA_CHECK(cudaFree(d_Q));
-    CUDA_CHECK(cudaFree(d_Kk));
-    CUDA_CHECK(cudaFree(d_V));
-    CUDA_CHECK(cudaFree(d_O));
-
-    CUDA_CHECK(cudaFreeHost(h_Q));
-    CUDA_CHECK(cudaFreeHost(h_K));
-    CUDA_CHECK(cudaFreeHost(h_V));
-    CUDA_CHECK(cudaFreeHost(h_O));
-
-    return 0;
-}
-
-#endif // GPT2_NO_MAIN

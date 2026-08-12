@@ -1,20 +1,70 @@
-#include "common.cuh"
+#include "kernels.cuh"
 #include <cuda_profiler_api.h>
-#include <cmath>
 #include <cfloat>
 
-// Anonymous namespace, not macros: BK is 64 in attention.cu and these names would
-// otherwise collide the moment a driver pulls both in.
-namespace {
-constexpr int BM = 128;
-constexpr int BN = 128;
-constexpr int BK = 32;
-}
+using namespace gemm_cfg;   // BM, BN, BK -- see kernels.cuh for why these are namespaced
 
 // Tune these, for max arithmetic intensity on matmul, M & N >> K (K Doesn't contribute).
 
-// A MxK, B KxN.
-__global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, const int M, const int K, const int N) {
+// The body is shared and the activation is a compile-time flag, so gemm and gemm_gelu
+// come out as two genuinely separate kernels with no duplicated source to drift apart.
+// GELU is never its own launch: elementwise over [T, 3072] would be pure bandwidth for
+// one multiply-add per element, and here the values are already in registers.
+
+// Epilogue selector. Nothing here is ever launched on its own: GELU elementwise over
+// [T, 3072] and RoPE elementwise over [T, 2304] would both be pure bandwidth for a
+// handful of flops, and in the epilogue the values are already in registers.
+namespace ep {
+constexpr int NONE     = 0;
+constexpr int GELU     = 1;
+constexpr int QKV_ROPE = 2;
+}
+
+// 10000^(-2i/d_head) == exp2(-2i/d_head * log2(10000))
+constexpr float LOG2_ROPE_BASE = 13.287712379549449f;
+
+
+// One k-tile of the warp's 64x32 output, accumulated into rC. Lifted out of the main
+// loop because the pipelined loop and the drain iteration both need it -- when this was
+// copy-pasted, a fix to one copy silently missed the other.
+__device__ __forceinline__ void mma_tile(const half* sA_stage, const half* sB_stage,
+                                         const int lane, const int warp_row_offset,
+                                         const int warp_col_offset, float rC[4][4][4]) {
+    const int lane_group = lane / 8;
+    const int row_in_group = lane % 8;
+
+    for (int k_dim = 0; k_dim < 2; ++k_dim) {
+        for (int m_dim = 0; m_dim < 4; ++m_dim) {
+            // tensor core ldmatrix register pattern has it as 4 8x8 tiles
+            int a_row = warp_row_offset + m_dim * 16 + row_in_group;
+            a_row = (lane_group == 0 || lane_group == 2) ? a_row : a_row + 8;
+
+            const int a_col = (lane_group == 0 || lane_group == 1) ? k_dim * 16 : k_dim * 16 + 8;
+
+            uint32_t rA[4];
+            ld_matrix_x4(rA, swizzled_ptr(sA_stage, a_row, a_col, BK));
+
+            for (int n_dim = 0; n_dim < 4; ++n_dim) {
+                int b_row = k_dim * 16 + row_in_group;
+                b_row = (lane_group == 0 || lane_group == 2) ? b_row : b_row + 8;
+
+                const int b_col = warp_col_offset + n_dim * 8;
+
+                // B is row-major [k][n] in smem but the mma wants it column-major over
+                // (k, n); the transposing ldmatrix does that for free, exactly as
+                // attention.cu does for V.
+                uint32_t rB[2];
+                ld_matrix_x2_trans(rB, swizzled_ptr(sB_stage, b_row, b_col, BN));
+                mma(rA, rB, rC[m_dim][n_dim]);
+            }
+        }
+    }
+}
+
+
+// A MxK, B KxN.  d_head is only read by the QKV_ROPE epilogue.
+template <int EP>
+__device__ __forceinline__ void gemm_body(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, const int M, const int K, const int N, const int d_head) {
     __shared__ half sA[2][BM][BK];
     __shared__ half sB[2][BK][BN];
 
@@ -30,13 +80,12 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
     int load_B_row = tid / 16;
     int load_B_col = blockIdx.x * BN + (tid % 16) * 8;
 
-    uint32_t rA[4]; uint32_t rB[2];
-    float rC[4][4][4] = {0.0f};
+    float rC[4][4][4] = {0.0f};   // rA / rB now live inside mma_tile
 
     int write_stage = 0; int read_stage = 0;
 
-    uint32_t smem_A_p1 = swizzled_ptr(&sA[0][0][0], tid / 4, (tid / 4) * 8, BK);
-    uint32_t smem_A_p2 = swizzled_ptr(&sA[0][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
+    uint32_t smem_A_p1 = swizzled_ptr(&sA[0][0][0], tid / 4, load_A_col, BK);
+    uint32_t smem_A_p2 = swizzled_ptr(&sA[0][0][0], tid / 4 + 64, load_A_col, BK);
     cp_async_128(smem_A_p1, &A[load_A_row * K + load_A_col]);
     cp_async_128(smem_A_p2, &A[(load_A_row + 64) * K + load_A_col]);
 
@@ -55,8 +104,8 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
         // preload next set of tiles
         write_stage ^= 1;
 
-        uint32_t smem_A_p1 = swizzled_ptr(&sA[write_stage][0][0], tid / 4, (tid / 4) * 8, BK);
-        uint32_t smem_A_p2 = swizzled_ptr(&sA[write_stage][0][0], tid / 4 + 64, (tid / 4) * 8, BK);
+        uint32_t smem_A_p1 = swizzled_ptr(&sA[write_stage][0][0], tid / 4, load_A_col, BK);
+        uint32_t smem_A_p2 = swizzled_ptr(&sA[write_stage][0][0], tid / 4 + 64, load_A_col, BK);
         cp_async_128(smem_A_p1, &A[load_A_row * K + load_A_col + tile_k]);
         cp_async_128(smem_A_p2, &A[(load_A_row + 64) * K + load_A_col + tile_k]);
 
@@ -65,74 +114,26 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
         cp_async_128(smem_B_p1, &B[load_B_row * N + load_B_col + tile_k * N]);
         cp_async_128(smem_B_p2, &B[(load_B_row + 16) * N + load_B_col + tile_k * N]);
 
-        cp_async_commit_group(); 
+        cp_async_commit_group();
 
-        for (int k_dim = 0; k_dim < 2; ++k_dim) {
-            for (int m_dim = 0; m_dim < 4; ++m_dim) {
-                int lane_group = lane / 8; 
-                int row_in_group = lane % 8;
-                
-
-                // tensor core ldmatrix register pattern has it as 4 8x8 tiles
-                int a_row, a_col;
-                a_row = warp_row_offset + m_dim * 16 + row_in_group;
-                a_row = (lane_group == 0 || lane_group == 2) ? a_row : a_row + 8;
-
-                a_col = (lane_group == 0 || lane_group == 1) ? k_dim * 16 : k_dim * 16 + 8;
-
-                uint32_t smem_read_A = swizzled_ptr(&sA[read_stage][0][0], a_row, a_col, BK);
-                ld_matrix_x4(rA, smem_read_A);
-
-                for (int n_dim = 0; n_dim < 4; ++n_dim) {
-                    int b_row, b_col;
-                    b_row = k_dim * 16 + row_in_group;
-                    b_row = (lane_group == 0 || lane_group == 2) ? b_row : b_row + 8;
-
-                    b_col = warp_col_offset + n_dim * 8;
-
-                    uint32_t smem_read_B = swizzled_ptr(&sB[read_stage][0][0], b_row, b_col, BN);
-                    ld_matrix_x2(rB, smem_read_B);
-                    mma(rA, rB, rC[m_dim][n_dim]);
-                }
-            }
-        }
+        mma_tile(&sA[read_stage][0][0], &sB[read_stage][0][0],
+                 lane, warp_row_offset, warp_col_offset, rC);
 
         read_stage ^= 1;
-        cp_async_wait_group<1>();
+        // Must be <0>, not <1>. The group committed above is precisely the one holding
+        // the tile the *next* iteration reads, so allowing one outstanding group lets
+        // the compute run against shared memory the copy has not finished writing. It
+        // races rather than fails: correct whenever the copy happens to land in time,
+        // which is why a per-kernel cudaDeviceSynchronize hides it completely.
+        // Overlap is unaffected -- the copy still runs underneath this tile's mmas.
+        cp_async_wait_group<0>();
         __syncthreads();
 
     }
 
     // last tile
-    for (int k_dim = 0; k_dim < 2; ++k_dim) {
-        for (int m_dim = 0; m_dim < 4; ++m_dim) {
-            int lane_group = lane / 8; 
-            int row_in_group = lane % 8;
-            
-
-            // tensor core ldmatrix register pattern has it as 4 8x8 tiles
-            int a_row, a_col;
-            a_row = warp_row_offset + m_dim * 16 + row_in_group;
-            a_row = (lane_group == 0 || lane_group == 2) ? a_row : a_row + 8;
-
-            a_col = (lane_group == 0 || lane_group == 1) ? k_dim * 16 : k_dim * 16 + 8;
-
-            uint32_t smem_read_A = swizzled_ptr(&sA[read_stage][0][0], a_row, a_col, BK);
-            ld_matrix_x4(rA, smem_read_A);
-
-            for (int n_dim = 0; n_dim < 4; ++n_dim) {
-                int b_row, b_col;
-                b_row = k_dim * 16 + row_in_group;
-                b_row = (lane_group == 0 || lane_group == 2) ? b_row : b_row + 8;
-
-                b_col = warp_col_offset + n_dim * 8;
-
-                uint32_t smem_read_B = swizzled_ptr(&sB[read_stage][0][0], b_row, b_col, BN);
-                ld_matrix_x2(rB, smem_read_B);
-                mma(rA, rB, rC[m_dim][n_dim]);
-            }
-        }
-    }
+    mma_tile(&sA[read_stage][0][0], &sB[read_stage][0][0],
+             lane, warp_row_offset, warp_col_offset, rC);
 
     // output is 16 x 8 per tile, each thread has 2 consecutive items in each of its 2 output rowws.
     int frag_row = lane / 4;
@@ -151,94 +152,68 @@ __global__ void gemm(const half* __restrict__ A, const half* __restrict__ B, hal
             int global_row = block_global_row + frag_row;
             int global_col = block_global_col + frag_col;
 
-            // Accumulation stays fp32 the whole way down; the narrowing happens once,
-            // here, so the next kernel in the chain can consume C as half directly.
-            C[global_row * N + global_col] = static_cast<half>(rC[m][n][0]);
-            C[global_row * N + global_col + 1] = static_cast<half>(rC[m][n][1]);
-            C[(global_row + 8) * N + global_col] = static_cast<half>(rC[m][n][2]);
-            C[(global_row + 8) * N + global_col + 1] = static_cast<half>(rC[m][n][3]);
+            // Accumulation stays fp32 the whole way down; the epilogue runs on the fp32
+            // accumulator and the narrowing happens once, here, so the next kernel in
+            // the chain can consume C as half directly.
+            float c0 = rC[m][n][0], c1 = rC[m][n][1];
+            float c2 = rC[m][n][2], c3 = rC[m][n][3];
+
+            if (EP == ep::GELU) {
+                c0 = gelu(c0); c1 = gelu(c1); c2 = gelu(c2); c3 = gelu(c3);
+            } else if (EP == ep::QKV_ROPE) {
+                // This C fragment is already in exactly the shape RoPE wants. Registers
+                // 0,1 hold columns (col, col+1) of one row and 2,3 the same two columns
+                // eight rows down, and col is always even -- so with the interleaved
+                // convention each register pair *is* one rotation pair. No shuffles, no
+                // shared memory, no separate pass over [T, 2304].
+                //
+                // Columns are laid out [Q | K | V], each d_model wide. Q and K rotate,
+                // V does not. d_model is a whole number of heads, so the offset within a
+                // head is just col % d_head for both.
+                const int d_model = N / 3;
+                if (global_col < 2 * d_model) {
+                    const int pair = (global_col % d_head) >> 1;
+                    const float inv_freq =
+                        exp2f(-((float)(2 * pair) / (float)d_head) * LOG2_ROPE_BASE);
+
+                    // The position is the token index, which is the global row.
+                    float s, c;
+                    sincosf((float)global_row * inv_freq, &s, &c);
+                    const float r0 = c0 * c - c1 * s;
+                    const float r1 = c0 * s + c1 * c;
+
+                    sincosf((float)(global_row + 8) * inv_freq, &s, &c);
+                    const float r2 = c2 * c - c3 * s;
+                    const float r3 = c2 * s + c3 * c;
+
+                    c0 = r0; c1 = r1; c2 = r2; c3 = r3;
+                }
+            }
+
+            C[global_row * N + global_col] = static_cast<half>(c0);
+            C[global_row * N + global_col + 1] = static_cast<half>(c1);
+            C[(global_row + 8) * N + global_col] = static_cast<half>(c2);
+            C[(global_row + 8) * N + global_col + 1] = static_cast<half>(c3);
         }
     }
 
 
 }
 
-#ifndef GPT2_NO_MAIN
 
-int main() {
-    // Grab at least one of the dims of the matmuls we're going to use the matmul for.
-    // Must be exact multiples of the block tiles (no boundary masking in the kernel):
-    //   M % BM(128) == 0,  N % BN(128) == 0,  K % BK(32) == 0
-    int M = 4096;
-    int N = 4096;
-    int K = 1024;
-
-    half *h_A, *h_B, *h_C;
-    CUDA_CHECK(cudaMallocHost(&h_A, sizeof(half) * M * K));
-    CUDA_CHECK(cudaMallocHost(&h_B, sizeof(half) * K * N));
-    CUDA_CHECK(cudaMallocHost(&h_C, sizeof(half) * M * N));
-
-    half *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc(&d_A, sizeof(half) * M * K));
-    CUDA_CHECK(cudaMalloc(&d_B, sizeof(half) * K * N));
-    CUDA_CHECK(cudaMalloc(&d_C, sizeof(half) * M * N));
-
-
-    for (int m = 0; m < M; ++m) {
-        for (int n = 0; n < K; ++n) {
-            h_A[m * K + n] = static_cast<half>(((m + 1 + n * 2) % 17) / 19.0f);
-        }
-    }
-
-    for (int m = 0; m < K; ++m) {
-        for (int n = 0; n < N; ++n) {
-            h_B[m * N + n] = static_cast<half>(((m + 1 + n * 2) % 17) / 21.0f);
-        }
-    }
-
-
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, sizeof(half) * M * K, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, sizeof(half) * K * N, cudaMemcpyHostToDevice));
-
-    dim3 tpb(256);                    // 8 warps (2 x 4 warp grid) -> fixed by the kernel
-    dim3 bpg(N / BN, M / BM);         // x -> N tiles, y -> M tiles
-
-    for (int i = 0; i < 50; ++i) {
-        gemm<<<bpg, tpb>>>(d_A, d_B, d_C, M, K, N); // warming up  (grid, block)
-    }
-
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaProfilerStart());
-
-
-    gemm<<<bpg, tpb>>>(d_A, d_B, d_C, M, K, N);   // grid, block
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaProfilerStop());
-
-
-    CUDA_CHECK(cudaMemcpy(h_C, d_C, sizeof(half) * M * N, cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    
-
-
-
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_C));
-
-    CUDA_CHECK(cudaFreeHost(h_A));
-    CUDA_CHECK(cudaFreeHost(h_B));
-    CUDA_CHECK(cudaFreeHost(h_C));
-
-    return 0;
+__global__ void gemm(const half* __restrict__ A, const half* __restrict__ B,
+                     half* __restrict__ C, const int M, const int K, const int N) {
+    gemm_body<ep::NONE>(A, B, C, M, K, N, 0);
 }
 
-#endif // GPT2_NO_MAIN
+__global__ void gemm_gelu(const half* __restrict__ A, const half* __restrict__ B,
+                          half* __restrict__ C, const int M, const int K, const int N) {
+    gemm_body<ep::GELU>(A, B, C, M, K, N, 0);
+}
+
+// The QKV projection with RoPE folded into the store. N must be 3 * d_model.
+__global__ void gemm_qkv_rope(const half* __restrict__ A, const half* __restrict__ B,
+                              half* __restrict__ C, const int M, const int K, const int N,
+                              const int d_head) {
+    gemm_body<ep::QKV_ROPE>(A, B, C, M, K, N, d_head);
+}
